@@ -624,8 +624,28 @@ ggml_metal_device_t ggml_metal_device_init(void) {
     assert(dev != NULL);
 
     if (dev->mtl_device == nil) {
-        dev->mtl_device = MTLCreateSystemDefaultDevice();
-
+        #if TARGET_OS_OSX
+        const char * env_dev_index = getenv("GGML_METAL_DEVICE_INDEX");
+        if (env_dev_index != NULL && env_dev_index[0] != '\0') {
+            char * endptr = NULL;
+            long idx = strtol(env_dev_index, &endptr, 10);
+            if (endptr != env_dev_index && *endptr == '\0' && idx >= 0) {
+                NSArray<id<MTLDevice>> * devices = MTLCopyAllDevices();
+                if (devices != nil && idx < (long) devices.count) {
+                    dev->mtl_device = devices[(NSUInteger) idx];
+                    GGML_LOG_INFO("%s: using device index %ld from GGML_METAL_DEVICE_INDEX\n", __func__, idx);
+                } else {
+                    GGML_LOG_WARN("%s: GGML_METAL_DEVICE_INDEX=%ld out of range (devices=%lu), using default device\n",
+                                  __func__, idx, devices ? (unsigned long) devices.count : 0UL);
+                }
+            } else {
+                GGML_LOG_WARN("%s: invalid GGML_METAL_DEVICE_INDEX='%s', using default device\n", __func__, env_dev_index);
+            }
+        }
+        #endif
+        if (dev->mtl_device == nil) {
+            dev->mtl_device = MTLCreateSystemDefaultDevice();
+        }
         if (dev->mtl_device) {
             dev->mtl_queue = [dev->mtl_device newCommandQueue];
             if (dev->mtl_queue == nil) {
