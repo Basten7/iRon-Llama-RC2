@@ -227,30 +227,52 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             }
 
             MTLCommandBufferStatus status = [cmd_buf status];
+            // A command buffer slot may be unused (NotEnqueued), or still in-flight when synchronize is called.
+            // Only treat MTLCommandBufferStatusError as fatal; otherwise wait for completion.
+            if (status == MTLCommandBufferStatusNotEnqueued) {
+                continue;
+            }
+            
             if (status != MTLCommandBufferStatusCompleted) {
-                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
-                if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                [cmd_buf waitUntilCompleted];
+                status = [cmd_buf status];
+            }
+            
+            if (status == MTLCommandBufferStatusError) {
+                NSError * err = [cmd_buf error];
+                GGML_LOG_ERROR("%s: error: command buffer %d failed\n", __func__, cb_idx);
+                if (err) {
+                    GGML_LOG_ERROR("error: %s\n", [[err localizedDescription] UTF8String]);
+                    GGML_LOG_ERROR("error domain: %s code: %ld\n", [[err domain] UTF8String], (long) [err code]);
                 }
                 GGML_ABORT("fatal error");
-            }
-        }
+            }        }
     }
 
     // release any completed extra command buffers
     if (ctx->cmd_bufs_ext.count > 0) {
         for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
             id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
-
+            
             MTLCommandBufferStatus status = [cmd_buf status];
+            if (status == MTLCommandBufferStatusNotEnqueued) {
+                [cmd_buf release];
+                continue;
+            }
             if (status != MTLCommandBufferStatusCompleted) {
-                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
-                if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                [cmd_buf waitUntilCompleted];
+                status = [cmd_buf status];
+            }
+            
+            if (status == MTLCommandBufferStatusError) {
+                NSError * err = [cmd_buf error];
+                GGML_LOG_ERROR("%s: error: ext command buffer %d failed\n", __func__, (int) i);
+                if (err) {
+                    GGML_LOG_ERROR("error: %s\n", [[err localizedDescription] UTF8String]);
+                    GGML_LOG_ERROR("error domain: %s code: %ld\n", [[err domain] UTF8String], (long) [err code]);
                 }
                 GGML_ABORT("fatal error");
             }
-
             [cmd_buf release];
         }
 
@@ -457,6 +479,25 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
 
+        // Without abort callback: ensure deterministic submission order.
+        // All command buffers have been encoded at this point; commit in a strict order to preserve dependencies.
+        if (ctx->abort_callback == NULL) {
+            // commit the main command buffer first (contains the first n_nodes_0 nodes)
+            id<MTLCommandBuffer> cmd_buf_main = ctx->cmd_bufs[n_cb].obj;
+            if (cmd_buf_main) {
+                [cmd_buf_main commit];
+            }
+
+            // then commit the remaining command buffers in increasing index order
+            for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+                id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+                if (cmd_buf) {
+                    [cmd_buf commit];
+                }
+            }
+        }
+
+
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
 
@@ -583,10 +624,15 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             idx += res - 1;
         }
 
-        ggml_metal_op_free(ctx_op);
+                ggml_metal_op_free(ctx_op);
 
-        if (cb_idx < 2 || ctx->abort_callback == NULL) {
-            [cmd_buf commit];
+        // Commit behavior:
+        // - Without abort callback: do not commit from worker threads (main thread commits in deterministic order).
+        // - With abort callback: preserve previous behavior by committing the main CB and the first two CBs early.
+        if (ctx->abort_callback != NULL) {
+            if (cb_idx < 2 || cb_idx == n_cb_l) {
+                [cmd_buf commit];
+            }
         }
     });
 }
