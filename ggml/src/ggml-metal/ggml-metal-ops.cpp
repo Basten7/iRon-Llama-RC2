@@ -1867,7 +1867,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         !ggml_is_transposed(op->src[1]) &&
         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
-        props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min) {
+        props_dev->has_simdgroup_mm && props_dev->supports_gpu_family_apple7 &&
+        ne00 >= 64 && ne11 > ne11_mm_min)  {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
         // some Metal matrix data types require aligned pointers
@@ -2017,8 +2018,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // ne21 = n_rows (batch size)
     const int ne21_mm_id_min = 32;
 
-    if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
-        // some Metal matrix data types require aligned pointers
+    if (props_dev->has_simdgroup_mm && props_dev->supports_gpu_family_apple7 &&
+        ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {        // some Metal matrix data types require aligned pointers
         // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
         //switch (op->src[0]->type) {
         //    case GGML_TYPE_F32:  GGML_ASSERT(nb01 % 16 == 0); break;
