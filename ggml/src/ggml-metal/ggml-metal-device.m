@@ -1223,7 +1223,6 @@ struct ggml_metal_buffer_wrapper {
     size_t   size;
 
     id<MTLBuffer> metal;
-    id<MTLBuffer> metal_private;
 };
 
 struct ggml_metal_buffer {
@@ -1285,7 +1284,7 @@ static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
     if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
         MTLResidencySetDescriptor * desc = [[MTLResidencySetDescriptor alloc] init];
         desc.label = @"ggml_metal";
-        desc.initialCapacity = buf->n_buffers *2;
+        desc.initialCapacity = buf->n_buffers;
 
         NSError * error;
         buf->rset = [buf->dev->mtl_device newResidencySetWithDescriptor:desc error:&error];
@@ -1299,9 +1298,6 @@ static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
 
         for (int i = 0; i < buf->n_buffers; i++) {
             [buf->rset addAllocation:buf->buffers[i].metal];
-            if (buf->buffers[i].metal_private != nil) {
-            [buf->rset addAllocation:buf->buffers[i].metal_private];
-            }
         }
 
         [buf->rset commit];
@@ -1384,8 +1380,7 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
         res->buffers[0].size  = size;
         res->buffers[0].metal = nil;
 
-                res->buffers[0].metal_private = nil;
-if (size_aligned > 0) {
+        if (size_aligned > 0) {
             if (props_dev->use_shared_buffers && shared) {
                 res->buffers[0].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:res->all_data
                                                                   length:size_aligned
@@ -1477,8 +1472,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         res->buffers[res->n_buffers].size  = size;
         res->buffers[res->n_buffers].metal = nil;
 
-                    res->buffers[res->n_buffers].metal_private = nil;
-if (size_aligned > 0) {
+        if (size_aligned > 0) {
                   if (!map_as_private) {
                       res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:ptr length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
                    } else {
@@ -1522,8 +1516,7 @@ if (size_aligned > 0) {
             res->buffers[res->n_buffers].size  = size_step_aligned;
             res->buffers[res->n_buffers].metal = nil;
 
-                        res->buffers[res->n_buffers].metal_private = nil;
-if (size_step_aligned > 0) {
+            if (size_step_aligned > 0) {
                 if (!map_as_private) {
                 res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:(void *) ((uint8_t *) ptr + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
                 } else {
@@ -1579,7 +1572,6 @@ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
 
     for (int i = 0; i < buf->n_buffers; i++) {
         [buf->buffers[i].metal release];
-        [buf->buffers[i].metal_private release];
     }
 
     ggml_metal_buffer_rset_free(buf);
