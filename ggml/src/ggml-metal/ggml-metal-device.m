@@ -628,8 +628,41 @@ ggml_metal_device_t ggml_metal_device_init(void) {
     assert(dev != NULL);
 
     if (dev->mtl_device == nil) {
-        dev->mtl_device = MTLCreateSystemDefaultDevice();
-
+                // Device selection (macOS): allow overriding the default device with GGML_METAL_DEVICE_INDEX
+                // Index corresponds to the ordering returned by MTLCopyAllDevices().
+        #if TARGET_OS_OSX
+                NSArray<id<MTLDevice>> * devices = MTLCopyAllDevices();
+                const char * env_dev_index = getenv("GGML_METAL_DEVICE_INDEX");
+                bool selected = false;
+        
+                if (devices && env_dev_index && env_dev_index[0]) {
+                    char * endptr = NULL;
+                    long idx = strtol(env_dev_index, &endptr, 10);
+        
+                    if (endptr != env_dev_index && *endptr == '\0') {
+                        if (idx >= 0 && (NSUInteger) idx < [devices count]) {
+                            dev->mtl_device = [devices objectAtIndex:(NSUInteger) idx];
+                            selected = true;
+                            GGML_LOG_INFO("%s: using device index %ld from GGML_METAL_DEVICE_INDEX\n", __func__, idx);
+                        } else {
+                            GGML_LOG_WARN("%s: GGML_METAL_DEVICE_INDEX=%ld out of range (devices=%lu), using default device\n",
+                                          __func__, idx, (unsigned long) [devices count]);
+                        }
+                    } else {
+                        GGML_LOG_WARN("%s: invalid GGML_METAL_DEVICE_INDEX='%s', using default device\n", __func__, env_dev_index);
+                    }
+                }
+        
+                if (!selected) {
+                    dev->mtl_device = MTLCreateSystemDefaultDevice();
+                }
+        
+                if (devices) {
+                    [devices release];
+                }
+        #else
+                dev->mtl_device = MTLCreateSystemDefaultDevice();
+        #endif
         if (dev->mtl_device) {
             dev->mtl_queue = [dev->mtl_device newCommandQueue];
             if (dev->mtl_queue == nil) {
