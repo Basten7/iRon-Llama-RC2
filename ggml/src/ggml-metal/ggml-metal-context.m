@@ -123,7 +123,20 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
     res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
-
+    
+    // On some discrete GPUs (non-unified memory), concurrency can cause non-deterministic results.
+    // Default to disabling it unless explicitly forced.
+    {
+        const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
+        const bool force_concurrency = getenv("GGML_METAL_CONCURRENCY_FORCE") != NULL;
+    
+        if (!force_concurrency && props_dev && !props_dev->has_unified_memory) {
+            if (res->use_concurrency) {
+                GGML_LOG_WARN("%s: disabling concurrency on discrete (non-unified) GPU; set GGML_METAL_CONCURRENCY_FORCE=1 to override\n", __func__);
+            }
+            res->use_concurrency = false;
+        }
+    }
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
         res->debug_graph = val ? atoi(val) : 0;
