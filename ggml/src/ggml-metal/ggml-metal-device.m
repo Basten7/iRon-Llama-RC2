@@ -8,17 +8,15 @@
 
 #include <stdatomic.h>
 
-#include <sys/mman.h>
-
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
 #endif
 
 // create residency sets only on macOS >= 15.0
-#if (TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000) || \
-    (TARGET_OS_IOS && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000) || \
-    (TARGET_OS_TV && __TV_OS_VERSION_MAX_ALLOWED >= 180000) || \
-    (TARGET_OS_VISION && __VISION_OS_VERSION_MAX_ALLOWED >= 200000)
+#if !TARGET_CPU_X86_64 && TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000 || \
+    TARGET_OS_IOS && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000 || \
+    TARGET_OS_TV && __TV_OS_VERSION_MAX_ALLOWED >= 180000 || \
+    TARGET_OS_VISION && __VISION_OS_VERSION_MAX_ALLOWED >= 200000
 #define GGML_METAL_HAS_RESIDENCY_SETS 1
 #endif
 
@@ -217,7 +215,7 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                 // dictionary of preprocessor macros
                 NSMutableDictionary * prep = [NSMutableDictionary dictionary];
 
-                if ((ggml_metal_device_get_props(dev)->has_bfloat) && (ggml_metal_device_get_props(dev)->has_unified_memory)) {
+                if (ggml_metal_device_get_props(dev)->has_bfloat) {
                     [prep setObject:@"1" forKey:@"GGML_METAL_HAS_BF16"];
                 }
 
@@ -525,6 +523,10 @@ struct ggml_metal_device {
     ggml_metal_library_t library;
 
     struct ggml_metal_device_props props;
+
+    // VRAM budget tracking for private (StorageModePrivate) mirrors on discrete GPUs
+    size_t vram_private_budget;
+    size_t vram_private_allocated;
 };
 
 //
@@ -626,28 +628,8 @@ ggml_metal_device_t ggml_metal_device_init(void) {
     assert(dev != NULL);
 
     if (dev->mtl_device == nil) {
-        #if TARGET_OS_OSX
-        const char * env_dev_index = getenv("GGML_METAL_DEVICE_INDEX");
-        if (env_dev_index != NULL && env_dev_index[0] != '\0') {
-            char * endptr = NULL;
-            long idx = strtol(env_dev_index, &endptr, 10);
-            if (endptr != env_dev_index && *endptr == '\0' && idx >= 0) {
-                NSArray<id<MTLDevice>> * devices = MTLCopyAllDevices();
-                if (devices != nil && idx < (long) devices.count) {
-                    dev->mtl_device = devices[(NSUInteger) idx];
-                    GGML_LOG_INFO("%s: using device index %ld from GGML_METAL_DEVICE_INDEX\n", __func__, idx);
-                } else {
-                    GGML_LOG_WARN("%s: GGML_METAL_DEVICE_INDEX=%ld out of range (devices=%lu), using default device\n",
-                                  __func__, idx, devices ? (unsigned long) devices.count : 0UL);
-                }
-            } else {
-                GGML_LOG_WARN("%s: invalid GGML_METAL_DEVICE_INDEX='%s', using default device\n", __func__, env_dev_index);
-            }
-        }
-        #endif
-        if (dev->mtl_device == nil) {
-            dev->mtl_device = MTLCreateSystemDefaultDevice();
-        }
+        dev->mtl_device = MTLCreateSystemDefaultDevice();
+
         if (dev->mtl_device) {
             dev->mtl_queue = [dev->mtl_device newCommandQueue];
             if (dev->mtl_queue == nil) {
@@ -785,7 +767,7 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                 }
             }
 
-            dev->props.use_residency_sets = false;
+            dev->props.use_residency_sets = true;
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
             dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
 #endif
@@ -812,6 +794,26 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                 dev->props.max_working_set_size   = dev->mtl_device.recommendedMaxWorkingSetSize;
             } else {
                 dev->props.max_working_set_size   = dev->mtl_device.maxBufferLength;
+            }
+
+            // Configure VRAM budget for private mirrors (discrete GPUs)
+            // - override total budget with: GGML_METAL_VRAM_BUDGET_MB
+            // - reserve margin with:        GGML_METAL_VRAM_RESERVE_MB (default: 2048)
+            {
+                const char * env_budget_mb  = getenv("GGML_METAL_VRAM_BUDGET_MB");
+                const char * env_reserve_mb = getenv("GGML_METAL_VRAM_RESERVE_MB");
+
+                const size_t reserve_mb    = env_reserve_mb ? (size_t) strtoull(env_reserve_mb, NULL, 10) : (size_t) 2048;
+                const size_t reserve_bytes = reserve_mb * (size_t) 1024 * (size_t) 1024;
+
+                size_t budget_bytes = dev->props.max_working_set_size;
+
+                if (env_budget_mb && env_budget_mb[0]) {
+                    budget_bytes = (size_t) strtoull(env_budget_mb, NULL, 10) * (size_t) 1024 * (size_t) 1024;
+                }
+
+                dev->vram_private_budget = budget_bytes > reserve_bytes ? (budget_bytes - reserve_bytes) : 0;
+                dev->vram_private_allocated = 0;
             }
 
             strncpy(dev->props.name, [[dev->mtl_device name] UTF8String], sizeof(dev->props.name) - 1);
@@ -1223,7 +1225,7 @@ struct ggml_metal_buffer_wrapper {
     size_t   size;
 
     id<MTLBuffer> metal;
-    id<MTLBuffer> metal_private;
+    id<MTLBuffer> metal_private; // optional VRAM mirror
 };
 
 struct ggml_metal_buffer {
@@ -1285,7 +1287,7 @@ static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
     if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
         MTLResidencySetDescriptor * desc = [[MTLResidencySetDescriptor alloc] init];
         desc.label = @"ggml_metal";
-        desc.initialCapacity = buf->n_buffers *2;
+        desc.initialCapacity = buf->n_buffers * 2;
 
         NSError * error;
         buf->rset = [buf->dev->mtl_device newResidencySetWithDescriptor:desc error:&error];
@@ -1299,8 +1301,8 @@ static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
 
         for (int i = 0; i < buf->n_buffers; i++) {
             [buf->rset addAllocation:buf->buffers[i].metal];
-            if (buf->buffers[i].metal_private != nil) {
-            [buf->rset addAllocation:buf->buffers[i].metal_private];
+            if (buf->buffers[i].metal_private) {
+                [buf->rset addAllocation:buf->buffers[i].metal_private];
             }
         }
 
@@ -1384,8 +1386,7 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
         res->buffers[0].size  = size;
         res->buffers[0].metal = nil;
 
-                res->buffers[0].metal_private = nil;
-if (size_aligned > 0) {
+        if (size_aligned > 0) {
             if (props_dev->use_shared_buffers && shared) {
                 res->buffers[0].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:res->all_data
                                                                   length:size_aligned
@@ -1424,20 +1425,11 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
     res->dev = dev;
-    const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
-
-    const bool force_private = getenv("GGML_METAL_FORCE_PRIVATE") != NULL;
-    const bool map_as_private = force_private && !props_dev->use_shared_buffers;
-
-    // For discrete GPUs, mmapped/shared buffers can be extremely slow (PCIe reads + page faults) and can also
-    // surface correctness issues under heavy concurrency. By default, create a private (VRAM) mirror for mapped
-    // buffers. Disable with: GGML_METAL_MMAP_PRIVATE_DISABLE=1
-    const bool want_private_mirror = !map_as_private && !props_dev->has_unified_memory && getenv("GGML_METAL_MMAP_PRIVATE_DISABLE") == NULL;
 
     res->all_data = ptr;
     res->all_size = size;
 
-    res->is_shared = !map_as_private;
+    res->is_shared = true;
     res->owned = false;
 
     res->n_buffers = 0;
@@ -1456,92 +1448,44 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         size_aligned += (size_page - (size_aligned % size_page));
     }
 
-#if TARGET_OS_OSX
-    // Optional: fault-in mmapped pages up-front to avoid random page faults during GPU reads on discrete GPUs.
-    // Enable with: GGML_METAL_MMAP_PREFETCH=1
-    if (getenv("GGML_METAL_MMAP_PREFETCH") != NULL) {
-        // best-effort hints; ignore failures
-        (void) madvise(ptr, size_aligned, MADV_SEQUENTIAL);
-        (void) madvise(ptr, size_aligned, MADV_WILLNEED);
-
-        // touch one byte per page to force residency now (avoids stalls later)
-        volatile uint8_t acc = 0;
-        volatile uint8_t * p8 = (volatile uint8_t *) ptr;
-        for (size_t off = 0; off < size_aligned; off += size_page) {
-            acc ^= p8[off];
-        }
-        // prevent compiler from optimizing away the loop
-        if (acc == 0xFF) {
-            GGML_LOG_DEBUG("%s: mmap prefetch acc=%u\n", __func__, (unsigned) acc);
-        }
-    }
-#endif
+    const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
 
     // the buffer fits into the max buffer size allowed by the device
     if (size_aligned <= props_dev->max_buffer_size) {
         res->buffers[res->n_buffers].data  = ptr;
-        res->buffers[res->n_buffers].size  = size_aligned;
+        res->buffers[res->n_buffers].size  = size;
         res->buffers[res->n_buffers].metal = nil;
+            res->buffers[res->n_buffers].metal_private = nil;
         res->buffers[res->n_buffers].metal_private = nil;
 
         if (size_aligned > 0) {
-            if (!map_as_private) {
-                res->buffers[res->n_buffers].metal =
-                    [res->dev->mtl_device newBufferWithBytesNoCopy:ptr
-                                                           length:size_aligned
-                                                          options:MTLResourceStorageModeShared
-                                                      deallocator:nil];
-
-                if (want_private_mirror && res->buffers[res->n_buffers].metal != nil) {
-                    @autoreleasepool {
-                        id<MTLBuffer> buf_dst =
-                            [res->dev->mtl_device newBufferWithLength:size_aligned
-                                                               options:MTLResourceStorageModePrivate];
-                        GGML_ASSERT(buf_dst);
-
-                        id<MTLCommandBuffer> cmd_buf = [res->dev->mtl_queue commandBufferWithUnretainedReferences];
-                        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-                        [encoder copyFromBuffer:res->buffers[res->n_buffers].metal
-                                   sourceOffset:0
-                                       toBuffer:buf_dst
-                              destinationOffset:0
-                                           size:size_aligned];
-                        [encoder endEncoding];
-                        [cmd_buf commit];
-                        [cmd_buf waitUntilCompleted];
-
-                        res->buffers[res->n_buffers].metal_private = buf_dst;
-                    }
-                }
-            } else {
-                @autoreleasepool {
-                    id<MTLBuffer> buf_src =
-                        [res->dev->mtl_device newBufferWithBytesNoCopy:ptr
-                                                               length:size_aligned
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
-                    id<MTLBuffer> buf_dst =
-                        [res->dev->mtl_device newBufferWithLength:size_aligned
-                                                           options:MTLResourceStorageModePrivate];
-                    GGML_ASSERT(buf_src);
-                    GGML_ASSERT(buf_dst);
-
-                    id<MTLCommandBuffer> cmd_buf = [res->dev->mtl_queue commandBufferWithUnretainedReferences];
-                    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-                    [encoder copyFromBuffer:buf_src sourceOffset:0 toBuffer:buf_dst destinationOffset:0 size:size_aligned];
-                    [encoder endEncoding];
-                    [cmd_buf commit];
-                    [cmd_buf waitUntilCompleted];
-
-                    [buf_src release];
-                    res->buffers[res->n_buffers].metal = buf_dst;
-                }
-            }
+            res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:ptr length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
 
             if (res->buffers[res->n_buffers].metal == nil) {
                 GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
                 free(res);
                 return NULL;
+            }
+
+            // On discrete GPUs, optionally create a VRAM (private) mirror for fast GPU reads.
+            const bool want_private_mirror = !props_dev->has_unified_memory &&
+                                             getenv("GGML_METAL_MMAP_PRIVATE_DISABLE") == NULL;
+            if (want_private_mirror && dev->vram_private_budget > 0) {
+                const size_t cur = __atomic_load_n(&dev->vram_private_allocated, __ATOMIC_RELAXED);
+                if (cur + size_aligned <= dev->vram_private_budget) {
+                    id<MTLBuffer> buf_dst = [res->dev->mtl_device newBufferWithLength:size_aligned options:MTLResourceStorageModePrivate];
+                    if (buf_dst) {
+                        id<MTLCommandBuffer> cmd_buf = [res->dev->mtl_queue commandBufferWithUnretainedReferences];
+                        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+                        [encoder copyFromBuffer:res->buffers[res->n_buffers].metal sourceOffset:0 toBuffer:buf_dst destinationOffset:0 size:size_aligned];
+                        [encoder endEncoding];
+                        [cmd_buf commit];
+                        [cmd_buf waitUntilCompleted];
+
+                        res->buffers[res->n_buffers].metal_private = buf_dst;
+                        __atomic_fetch_add(&dev->vram_private_allocated, size_aligned, __ATOMIC_RELAXED);
+                    }
+                }
             }
         }
 
@@ -1564,64 +1508,33 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
             res->buffers[res->n_buffers].metal_private = nil;
 
             if (size_step_aligned > 0) {
-                if (!map_as_private) {
-                    res->buffers[res->n_buffers].metal =
-                        [res->dev->mtl_device newBufferWithBytesNoCopy:(void *) ((uint8_t *) ptr + i)
-                                                               length:size_step_aligned
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
-
-                    if (want_private_mirror && res->buffers[res->n_buffers].metal != nil) {
-                        @autoreleasepool {
-                            id<MTLBuffer> buf_dst =
-                                [res->dev->mtl_device newBufferWithLength:size_step_aligned
-                                                                   options:MTLResourceStorageModePrivate];
-                            GGML_ASSERT(buf_dst);
-
-                            id<MTLCommandBuffer> cmd_buf = [res->dev->mtl_queue commandBufferWithUnretainedReferences];
-                            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-                            [encoder copyFromBuffer:res->buffers[res->n_buffers].metal
-                                       sourceOffset:0
-                                           toBuffer:buf_dst
-                                  destinationOffset:0
-                                               size:size_step_aligned];
-                            [encoder endEncoding];
-                            [cmd_buf commit];
-                            [cmd_buf waitUntilCompleted];
-
-                            res->buffers[res->n_buffers].metal_private = buf_dst;
-                        }
-                    }
-                } else {
-                    @autoreleasepool {
-                        void * p_i = (void *) ((uint8_t *) ptr + i);
-                        id<MTLBuffer> buf_src =
-                            [res->dev->mtl_device newBufferWithBytesNoCopy:p_i
-                                                                   length:size_step_aligned
-                                                                  options:MTLResourceStorageModeShared
-                                                              deallocator:nil];
-                        id<MTLBuffer> buf_dst =
-                            [res->dev->mtl_device newBufferWithLength:size_step_aligned
-                                                               options:MTLResourceStorageModePrivate];
-                        GGML_ASSERT(buf_src);
-                        GGML_ASSERT(buf_dst);
-
-                        id<MTLCommandBuffer> cmd_buf = [res->dev->mtl_queue commandBufferWithUnretainedReferences];
-                        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-                        [encoder copyFromBuffer:buf_src sourceOffset:0 toBuffer:buf_dst destinationOffset:0 size:size_step_aligned];
-                        [encoder endEncoding];
-                        [cmd_buf commit];
-                        [cmd_buf waitUntilCompleted];
-
-                        [buf_src release];
-                        res->buffers[res->n_buffers].metal = buf_dst;
-                    }
-                }
+                res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:(void *) ((uint8_t *) ptr + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
 
                 if (res->buffers[res->n_buffers].metal == nil) {
                     GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_step_aligned / 1024.0 / 1024.0);
                     free(res);
                     return NULL;
+                }
+
+                // On discrete GPUs, optionally create a VRAM (private) mirror for fast GPU reads.
+                const bool want_private_mirror = !props_dev->has_unified_memory &&
+                                                 getenv("GGML_METAL_MMAP_PRIVATE_DISABLE") == NULL;
+                if (want_private_mirror && dev->vram_private_budget > 0) {
+                    const size_t cur = __atomic_load_n(&dev->vram_private_allocated, __ATOMIC_RELAXED);
+                    if (cur + size_step_aligned <= dev->vram_private_budget) {
+                        id<MTLBuffer> buf_dst = [res->dev->mtl_device newBufferWithLength:size_step_aligned options:MTLResourceStorageModePrivate];
+                        if (buf_dst) {
+                            id<MTLCommandBuffer> cmd_buf = [res->dev->mtl_queue commandBufferWithUnretainedReferences];
+                            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+                            [encoder copyFromBuffer:res->buffers[res->n_buffers].metal sourceOffset:0 toBuffer:buf_dst destinationOffset:0 size:size_step_aligned];
+                            [encoder endEncoding];
+                            [cmd_buf commit];
+                            [cmd_buf waitUntilCompleted];
+
+                            res->buffers[res->n_buffers].metal_private = buf_dst;
+                            __atomic_fetch_add(&dev->vram_private_allocated, size_step_aligned, __ATOMIC_RELAXED);
+                        }
+                    }
                 }
             }
 
@@ -1648,13 +1561,16 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     return res;
 }
 
-
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
     ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
     for (int i = 0; i < buf->n_buffers; i++) {
+        if (buf->buffers[i].metal_private) {
+            const size_t len = (size_t) [buf->buffers[i].metal_private length];
+            __atomic_fetch_sub(&buf->dev->vram_private_allocated, len, __ATOMIC_RELAXED);
+            [buf->buffers[i].metal_private release];
+        }
         [buf->buffers[i].metal release];
-        [buf->buffers[i].metal_private release];
     }
 
     ggml_metal_buffer_rset_free(buf);
@@ -1833,7 +1749,7 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
 
         //GGML_LOG_INFO("ioffs = %10ld, tsize = %10ld, sum = %10ld, buf->buffers[%d].size = %10ld\n", ioffs, tsize, ioffs + tsize, i, buf->buffers[i].size);
         if (ioffs >= 0 && ioffs + tsize <= (int64_t) buf->buffers[i].size) {
-            res.metal = buf->buffers[i].metal_private != nil ? buf->buffers[i].metal_private : buf->buffers[i].metal;
+            res.metal = buf->buffers[i].metal_private ? buf->buffers[i].metal_private : buf->buffers[i].metal;
             res.offs  = (size_t) ioffs;
 
             //GGML_LOG_INFO("%s: tensor '%16s', offs = %8ld\n", __func__, t->name, *offs);
