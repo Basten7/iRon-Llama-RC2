@@ -1516,11 +1516,18 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
                         [cmd_buf waitUntilCompleted];
 
                         res->buffers[res->n_buffers].metal_private = buf_dst;
-                        __atomic_fetch_add(&dev->vram_private_allocated, size_aligned, __ATOMIC_RELAXED);
+                        __atomic_fetch_add(&dev->vram_private_allocated, size_aligned, __ATOMIC_RELAXED);                    } else {
+                        GGML_LOG_WARN("%s: failed to allocate private mirror (size=%8.2f MiB) - using shared mmap\n",
+                                      __func__, size_aligned / 1024.0 / 1024.0);
                     }
+                } else {
+                    GGML_LOG_WARN("%s: VRAM budget exceeded for mmap private mirror (need=%8.2f MiB, used=%8.2f MiB, budget=%8.2f MiB) - using shared mmap\n",
+                                  __func__,
+                                  size_aligned / 1024.0 / 1024.0,
+                                  cur / 1024.0 / 1024.0,
+                                  dev->vram_private_budget / 1024.0 / 1024.0);
                 }
-            }
-        }
+            }}
 
         ggml_metal_log_allocated_size(res->dev->mtl_device, size_aligned);
 
@@ -1565,11 +1572,18 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
                             [cmd_buf waitUntilCompleted];
 
                             res->buffers[res->n_buffers].metal_private = buf_dst;
-                            __atomic_fetch_add(&dev->vram_private_allocated, size_step_aligned, __ATOMIC_RELAXED);
+                            __atomic_fetch_add(&dev->vram_private_allocated, size_step_aligned, __ATOMIC_RELAXED);                        } else {
+                            GGML_LOG_WARN("%s: failed to allocate private mirror (size=%8.2f MiB) - using shared mmap\n",
+                                          __func__, size_step_aligned / 1024.0 / 1024.0);
                         }
+                    } else {
+                        GGML_LOG_WARN("%s: VRAM budget exceeded for mmap private mirror (need=%8.2f MiB, used=%8.2f MiB, budget=%8.2f MiB) - using shared mmap\n",
+                                      __func__,
+                                      size_step_aligned / 1024.0 / 1024.0,
+                                      cur / 1024.0 / 1024.0,
+                                      dev->vram_private_budget / 1024.0 / 1024.0);
                     }
-                }
-            }
+                }}
 
             ggml_metal_log_allocated_size(res->dev->mtl_device, size_step_aligned);
 
