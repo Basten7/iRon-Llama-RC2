@@ -8,17 +8,17 @@
 
 #include <stdatomic.h>
 
-#include <sys/mman.h>
+#include <string.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
 #endif
 
 // create residency sets only on macOS >= 15.0
-#if (TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000) || \
-    (TARGET_OS_IOS && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000) || \
-    (TARGET_OS_TV && __TV_OS_VERSION_MAX_ALLOWED >= 180000) || \
-    (TARGET_OS_VISION && __VISION_OS_VERSION_MAX_ALLOWED >= 200000)
+#if !TARGET_CPU_X86_64 && TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000 || \
+    TARGET_OS_IOS && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000 || \
+    TARGET_OS_TV && __TV_OS_VERSION_MAX_ALLOWED >= 180000 || \
+    TARGET_OS_VISION && __VISION_OS_VERSION_MAX_ALLOWED >= 200000
 #define GGML_METAL_HAS_RESIDENCY_SETS 1
 #endif
 
@@ -217,7 +217,7 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                 // dictionary of preprocessor macros
                 NSMutableDictionary * prep = [NSMutableDictionary dictionary];
 
-                if ((ggml_metal_device_get_props(dev)->has_bfloat) && (ggml_metal_device_get_props(dev)->has_unified_memory)) {
+                if (ggml_metal_device_get_props(dev)->has_bfloat) {
                     [prep setObject:@"1" forKey:@"GGML_METAL_HAS_BF16"];
                 }
 
@@ -626,6 +626,7 @@ ggml_metal_device_t ggml_metal_device_init(void) {
     assert(dev != NULL);
 
     if (dev->mtl_device == nil) {
+
         #if TARGET_OS_OSX
         const char * env_dev_index = getenv("GGML_METAL_DEVICE_INDEX");
         if (env_dev_index != NULL && env_dev_index[0] != '\0') {
@@ -639,6 +640,11 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                 } else {
                     GGML_LOG_WARN("%s: GGML_METAL_DEVICE_INDEX=%ld out of range (devices=%lu), using default device\n",
                                   __func__, idx, devices ? (unsigned long) devices.count : 0UL);
+                    if (devices != nil) {
+                        for (NSUInteger di = 0; di < devices.count; ++di) {
+                            GGML_LOG_INFO("%s: device[%lu] = %s\n", __func__, (unsigned long) di, [[devices[di] name] UTF8String]);
+                        }
+                    }
                 }
             } else {
                 GGML_LOG_WARN("%s: invalid GGML_METAL_DEVICE_INDEX='%s', using default device\n", __func__, env_dev_index);
@@ -648,6 +654,7 @@ ggml_metal_device_t ggml_metal_device_init(void) {
         if (dev->mtl_device == nil) {
             dev->mtl_device = MTLCreateSystemDefaultDevice();
         }
+
         if (dev->mtl_device) {
             dev->mtl_queue = [dev->mtl_device newCommandQueue];
             if (dev->mtl_queue == nil) {
@@ -785,7 +792,7 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                 }
             }
 
-            dev->props.use_residency_sets = false;
+            dev->props.use_residency_sets = true;
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
             dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
 #endif
@@ -1419,18 +1426,35 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
     res->dev = dev;
-    const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
-    const bool force_private = getenv("GGML_METAL_FORCE_PRIVATE") != NULL;
-    const bool map_as_private = force_private && !props_dev->use_shared_buffers;
-
-    
-    res->all_data = ptr;
+    const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);    res->all_data = ptr;
     res->all_size = size;
 
-    res->is_shared = !map_as_private;
+    res->is_shared = true;
     res->owned = false;
 
     res->n_buffers = 0;
+
+    // On discrete GPUs, reading mmapped weights through Shared buffers can be extremely slow
+    // (page faults + PCIe). To improve performance and stability, copy the mapped region into
+    // a pinned host allocation once, then map that copy.
+    // Disable with: GGML_METAL_MMAP_HOST_COPY_DISABLE=1
+    if (!props_dev->has_unified_memory && getenv("GGML_METAL_MMAP_HOST_COPY_DISABLE") == NULL) {
+        void * ptr_copy = ggml_metal_host_malloc(size);
+        if (ptr_copy == NULL) {
+            GGML_LOG_ERROR("%s: error: failed to allocate host copy for mapped buffer, size = %8.2f MiB\n",
+                           __func__, size / 1024.0 / 1024.0);
+            free(res);
+            return NULL;
+        }
+        memcpy(ptr_copy, ptr, size);
+        res->all_data = ptr_copy;
+        res->all_size = size;
+        res->owned    = true;
+        // this is still a CPU-accessible buffer (required by the shared buffer backend)
+        res->is_shared = true;
+        ptr = ptr_copy;
+        // Note: do not touch the original mapping; the caller owns it.
+    }
 
     const size_t size_page = sysconf(_SC_PAGESIZE);
 
@@ -1445,26 +1469,6 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     if ((size_aligned % size_page) != 0) {
         size_aligned += (size_page - (size_aligned % size_page));
     }
-    #if TARGET_OS_OSX
-        // Optional: fault-in mmapped pages up-front to avoid random page faults during GPU reads on discrete GPUs.
-        // Enable with: GGML_METAL_MMAP_PREFETCH=1
-        if (getenv("GGML_METAL_MMAP_PREFETCH") != NULL) {
-            // best-effort hints; ignore failures
-            (void) madvise(ptr, size_aligned, MADV_SEQUENTIAL);
-            (void) madvise(ptr, size_aligned, MADV_WILLNEED);
-    
-            // touch one byte per page to force residency now (avoids stalls later)
-            volatile uint8_t acc = 0;
-            volatile uint8_t * p8 = (volatile uint8_t *) ptr;
-            for (size_t off = 0; off < size_aligned; off += size_page) {
-                acc ^= p8[off];
-            }
-            // prevent compiler from optimizing away the loop
-            if (acc == 0xFF) {
-                GGML_LOG_DEBUG("%s: mmap prefetch acc=%u\n", __func__, (unsigned) acc);
-            }
-        }
-    #endif
 
     // the buffer fits into the max buffer size allowed by the device
     if (size_aligned <= props_dev->max_buffer_size) {
@@ -1473,24 +1477,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         res->buffers[res->n_buffers].metal = nil;
 
         if (size_aligned > 0) {
-                  if (!map_as_private) {
-                      res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:ptr length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
-                   } else {
-                      @autoreleasepool {
-                          id<MTLBuffer> buf_src = [res->dev->mtl_device newBufferWithBytesNoCopy:ptr length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
-                          id<MTLBuffer> buf_dst = [res->dev->mtl_device newBufferWithLength:size_aligned options:MTLResourceStorageModePrivate];
-                          GGML_ASSERT(buf_src);
-                          GGML_ASSERT(buf_dst);
-                          id<MTLCommandBuffer> cmd_buf = [res->dev->mtl_queue commandBufferWithUnretainedReferences];
-                          id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-                          [encoder copyFromBuffer:buf_src sourceOffset:0 toBuffer:buf_dst destinationOffset:0 size:size_aligned];
-                          [encoder endEncoding];
-                          [cmd_buf commit];
-                          [cmd_buf waitUntilCompleted];
-                          [buf_src release];
-                          res->buffers[res->n_buffers].metal = buf_dst;
-                      }
-                  }
+            res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:ptr length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
 
             if (res->buffers[res->n_buffers].metal == nil) {
                 GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
@@ -1517,26 +1504,8 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
             res->buffers[res->n_buffers].metal = nil;
 
             if (size_step_aligned > 0) {
-                if (!map_as_private) {
                 res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:(void *) ((uint8_t *) ptr + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
-                } else {
-                @autoreleasepool {
-                    void * p_i = (void *) ((uint8_t *) ptr + i);
-                    id<MTLBuffer> buf_src = [res->dev->mtl_device newBufferWithBytesNoCopy:p_i length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
-                    id<MTLBuffer> buf_dst = [res->dev->mtl_device newBufferWithLength:size_step_aligned
-                                                                              options:MTLResourceStorageModePrivate];
-                    GGML_ASSERT(buf_src);
-                    GGML_ASSERT(buf_dst);
-                    id<MTLCommandBuffer> cmd_buf = [res->dev->mtl_queue commandBufferWithUnretainedReferences];
-                    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-                    [encoder copyFromBuffer:buf_src sourceOffset:0 toBuffer:buf_dst destinationOffset:0 size:size_step_aligned];
-                    [encoder endEncoding];
-                    [cmd_buf commit];
-                    [cmd_buf waitUntilCompleted];
-                    [buf_src release];
-                    res->buffers[res->n_buffers].metal = buf_dst;
-                }
-                }
+
                 if (res->buffers[res->n_buffers].metal == nil) {
                     GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_step_aligned / 1024.0 / 1024.0);
                     free(res);
