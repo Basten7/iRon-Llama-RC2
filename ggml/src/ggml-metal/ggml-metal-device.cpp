@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <cstdlib>
 
 struct ggml_metal_device_deleter {
     void operator()(ggml_metal_device_t ctx) {
@@ -665,10 +666,35 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nr0 = N_R0_Q3_K;
             } break;
         case GGML_TYPE_Q4_K:
+        {
+            nsg = N_SG_Q4_K;
+            nr0 = N_R0_Q4_K;
+            // Optional override: more simdgroups per threadgroup for Q4_K mat-vec.
+            // Intended for AMD dGPU (W6800X) tuning without impacting other devices by default.
+            // Usage: export GGML_METAL_Q4K_NSG=4
+            if (const char * env = getenv("GGML_METAL_Q4K_NSG")) {
+                const int v = atoi(env);
+                if (v >= 1 && v <= 8) {
+                    nsg = v;
+                }
+            }
+            // Optional override: rows per threadgroup for Q4_K mat-vec.
+            // Usage: export GGML_METAL_Q4K_NR0=32
+            if (const char * env = getenv("GGML_METAL_Q4K_NR0")) {
+                const int v = atoi(env);
+                // keep conservative bounds; values should typically be multiples of 8
+                if (v >= 8 && v <= 256) {
+                    nr0 = v;
+                }
+            }
             {
-                nsg = N_SG_Q4_K;
-                nr0 = N_R0_Q4_K;
-            } break;
+                static bool s_logged_q4k_nr0 = false;
+                if (!s_logged_q4k_nr0 && getenv("GGML_METAL_Q4K_NR0") != NULL) {
+                    s_logged_q4k_nr0 = true;
+                    GGML_LOG_INFO("%s: Q4_K NR0 override = %d\n", __func__, (int) nr0);
+                }
+            }
+        } break;
         case GGML_TYPE_Q5_K:
             {
                 nsg = N_SG_Q5_K;
@@ -880,6 +906,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
+                // Optional override (same as main mul_mv path):
+                // export GGML_METAL_Q4K_NSG=4
+                if (const char * env = getenv("GGML_METAL_Q4K_NSG")) {
+                    const int v = atoi(env);
+                    if (v >= 1 && v <= 8) {
+                        nsg = v;
+                        }
+                        }
+                        // Optional override: rows per threadgroup for Q4_K mat-vec.
+                        // export GGML_METAL_Q4K_NR0=32
+                        if (const char * env = getenv("GGML_METAL_Q4K_NR0")) {
+                        const int v = atoi(env);
+                        if (v >= 8 && v <= 256) {
+                            nr0 = v;
+                    }
+                }
             } break;
         case GGML_TYPE_Q5_K:
             {

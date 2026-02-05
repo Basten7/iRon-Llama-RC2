@@ -246,6 +246,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
 
+// Convenience helper for device-specific tuning.
+// (Used by ggml-metal-device.cpp; implemented in ggml-metal-device.m)
+bool ggml_metal_device_is_amd(ggml_metal_device_t dev);
+
 //
 // device buffers
 //
