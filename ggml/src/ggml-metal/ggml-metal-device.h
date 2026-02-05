@@ -241,6 +241,7 @@ void ggml_metal_device_rsets_rm (ggml_metal_device_t dev, ggml_metal_rset_t rset
 void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev);
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
+bool ggml_metal_device_is_amd(ggml_metal_device_t dev);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);

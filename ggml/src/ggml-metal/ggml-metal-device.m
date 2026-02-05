@@ -998,6 +998,19 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
     }
 }
 
+bool ggml_metal_device_is_amd(ggml_metal_device_t dev) {
+    if (!dev || !dev->mtl_device) {
+        return false;
+    }
+
+    NSString * name = [dev->mtl_device name];
+    if (!name) {
+        return false;
+    }
+
+    return [name rangeOfString:@"AMD"].location != NSNotFound;
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
