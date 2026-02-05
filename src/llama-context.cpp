@@ -3602,10 +3602,16 @@ void llama_memory_breakdown_print(const struct llama_context * ctx) {
 
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
-
+        
+        // Clamp to avoid size_t underflow when a backend reports used > total (e.g. discrete GPU over-budget).
+        if (free > total) {
+            free = 0;
+         }
+        
         const size_t self = mb.model + mb.context + mb.compute;
-        const size_t unaccounted = total - self - free;
-
+        const size_t used = self + free;
+        const size_t unaccounted = (used <= total) ? (total - used) : 0;
+        
         table_data.push_back({
             template_gpu,
             "  - " + name + " (" + desc + ")",

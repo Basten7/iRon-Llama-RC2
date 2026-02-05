@@ -214,7 +214,16 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
             @autoreleasepool {
                 // dictionary of preprocessor macros
                 NSMutableDictionary * prep = [NSMutableDictionary dictionary];
-
+                // AMD (RDNA*) specialization switch for shader compile.
+                // This is compile-time for ggml-metal.metal (not runtime), and does NOT affect device selection
+                // (GGML_METAL_DEVICE_INDEX stays intact).
+                {
+                    NSString * dev_name = [device name];
+                    if (dev_name && [dev_name rangeOfString:@"AMD"].location != NSNotFound) {
+                        [prep setObject:@"1" forKey:@"GGML_METAL_GPU_AMD"];
+                    }
+                }
+                
                 if (ggml_metal_device_get_props(dev)->has_bfloat) {
                     [prep setObject:@"1" forKey:@"GGML_METAL_HAS_BF16"];
                 }

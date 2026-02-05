@@ -20,7 +20,14 @@
 #define N_R0_Q5_1 4
 #define N_SG_Q5_1 2
 
+//#define N_R0_Q8_0 2
+// On AMD dGPU (RDNA2 / W6800X), a larger row tile tends to improve occupancy for q8_0 mat-vec.
+// Enabled via GGML_METAL_GPU_AMD set at Metal compile time.
+#if defined(GGML_METAL_GPU_AMD)
+#define N_R0_Q8_0 4
+#else
 #define N_R0_Q8_0 2
+#endif
 #define N_SG_Q8_0 4
 
 #define N_R0_MXFP4 2
