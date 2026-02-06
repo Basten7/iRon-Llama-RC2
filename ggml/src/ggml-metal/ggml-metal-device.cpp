@@ -622,6 +622,33 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     smem = 32*sizeof(float)*nr0;
                     suffix = ne00 % 4 == 0 ? "_4" : "";
                 }
+                // Optional override: rows per threadgroup for F32/F16 mat-vec (non-short path).
+                // Usage:
+                //   export GGML_METAL_F32_NR0=8
+                //   export GGML_METAL_F16_NR0=8
+                if (strcmp(suffix, "_short") != 0) {
+                    const bool is_f32 = (tsrc0 == GGML_TYPE_F32);
+                    const bool is_f16 = (tsrc0 == GGML_TYPE_F16);
+                    const char * env = is_f32 ? getenv("GGML_METAL_F32_NR0")
+                                     : is_f16 ? getenv("GGML_METAL_F16_NR0")
+                                              : NULL;
+                    if (env) {
+                        const int v = atoi(env);
+                        // keep conservative bounds; large values increase threadgroup memory usage
+                        if (v >= 1 && v <= 256) {
+                            nr0  = v;
+                            smem = 32*sizeof(float)*nr0;
+                        }
+                        static bool s_logged_f32 = false;
+                        static bool s_logged_f16 = false;
+                        bool & s_logged = is_f32 ? s_logged_f32 : s_logged_f16;
+                        if (!s_logged) {
+                            s_logged = true;
+                            GGML_LOG_INFO("%s: %s NR0 override = %d\n",
+                                          __func__, is_f32 ? "F32" : "F16", (int) nr0);
+                        }
+                    }
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {
@@ -776,27 +803,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
                 GGML_ABORT("not implemented");
             }
-            // Optional overrides for F16/F32 mat-vec tiling (non-short path).
-            // Default behavior is unchanged unless env vars are set.
-            if ((tsrc0 == GGML_TYPE_F16 || tsrc0 == GGML_TYPE_F32) && strcmp(suffix, "_short") != 0) {
-                const bool is_f16 = (tsrc0 == GGML_TYPE_F16);
-                const char * env = getenv(is_f16 ? "GGML_METAL_F16_NR0" : "GGML_METAL_F32_NR0");
-                if (env) {
-                    const int v = atoi(env);
-                    // keep conservative bounds; large values increase threadgroup memory usage
-                    if (v >= 1 && v <= 256) {
-                        nr0  = v;
-                        smem = 32*sizeof(float)*nr0;
-                    }
-                    static bool s_logged_f16 = false;
-                    static bool s_logged_f32 = false;
-                    bool & s_logged = is_f16 ? s_logged_f16 : s_logged_f32;
-                    if (!s_logged) {
-                        s_logged = true;
-                        GGML_LOG_INFO("%s: %s NR0 override = %d\n", __func__, is_f16 ? "F16" : "F32", (int) nr0);
-                    }
-                }
-            }
     };
 
     snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
@@ -895,6 +901,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nr1 = 1;
                 smem = 32*sizeof(float)*nr0;
                 suffix = ne00 % 4 == 0 ? "_4" : "";
+                
+                // Optional override for F32/F16 (mul_mv_id path).
+                // Usage:
+                //   export GGML_METAL_F32_NR0=8
+                //   export GGML_METAL_F16_NR0=8
+                const bool is_f32 = (tsrc0 == GGML_TYPE_F32);
+                const bool is_f16 = (tsrc0 == GGML_TYPE_F16);
+                const char * env = is_f32 ? getenv("GGML_METAL_F32_NR0")
+                                 : is_f16 ? getenv("GGML_METAL_F16_NR0")
+                                          : NULL;
+                if (env) {
+                    const int v = atoi(env);
+                    if (v >= 1 && v <= 256) {
+                        nr0  = v;
+                        smem = 32*sizeof(float)*nr0;
+                    }
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {
