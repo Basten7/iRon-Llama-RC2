@@ -704,6 +704,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q6_K;
                 nr0 = N_R0_Q6_K;
+                // Optional override: rows per threadgroup for Q6_K mat-vec.
+                // Intended for AMD dGPU tuning without impacting other devices by default.
+                // Usage: export GGML_METAL_Q6K_NR0=128
+                if (const char * env = getenv("GGML_METAL_Q6K_NR0")) {
+                    const int v = atoi(env);
+                    // keep conservative bounds; values should typically be multiples of 8
+                    if (v >= 8 && v <= 256) {
+                        nr0 = v;
+                    }
+                    static bool s_logged_q6k_nr0 = false;
+                    if (!s_logged_q6k_nr0) {
+                        s_logged_q6k_nr0 = true;
+                        GGML_LOG_INFO("%s: Q6_K NR0 override = %d\n", __func__, (int) nr0);
+                    }
+                }
             } break;
         case GGML_TYPE_IQ2_XXS:
             {
@@ -760,6 +775,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
                 GGML_ABORT("not implemented");
+            }
+            // Optional overrides for F16/F32 mat-vec tiling (non-short path).
+            // Default behavior is unchanged unless env vars are set.
+            if ((tsrc0 == GGML_TYPE_F16 || tsrc0 == GGML_TYPE_F32) && strcmp(suffix, "_short") != 0) {
+                const bool is_f16 = (tsrc0 == GGML_TYPE_F16);
+                const char * env = getenv(is_f16 ? "GGML_METAL_F16_NR0" : "GGML_METAL_F32_NR0");
+                if (env) {
+                    const int v = atoi(env);
+                    // keep conservative bounds; large values increase threadgroup memory usage
+                    if (v >= 1 && v <= 256) {
+                        nr0  = v;
+                        smem = 32*sizeof(float)*nr0;
+                    }
+                    static bool s_logged_f16 = false;
+                    static bool s_logged_f32 = false;
+                    bool & s_logged = is_f16 ? s_logged_f16 : s_logged_f32;
+                    if (!s_logged) {
+                        s_logged = true;
+                        GGML_LOG_INFO("%s: %s NR0 override = %d\n", __func__, is_f16 ? "F16" : "F32", (int) nr0);
+                    }
+                }
             }
     };
 
@@ -912,14 +948,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                     const int v = atoi(env);
                     if (v >= 1 && v <= 8) {
                         nsg = v;
-                        }
-                        }
-                        // Optional override: rows per threadgroup for Q4_K mat-vec.
-                        // export GGML_METAL_Q4K_NR0=32
-                        if (const char * env = getenv("GGML_METAL_Q4K_NR0")) {
-                        const int v = atoi(env);
-                        if (v >= 8 && v <= 256) {
-                            nr0 = v;
+                    }
+                }
+                // Optional override: rows per threadgroup for Q4_K mat-vec.
+                // export GGML_METAL_Q4K_NR0=128
+                if (const char * env = getenv("GGML_METAL_Q4K_NR0")) {
+                    const int v = atoi(env);
+                    // keep conservative bounds; values should typically be multiples of 8
+                    if (v >= 8 && v <= 256) {
+                        nr0 = v;
+                    }
+                    static bool s_logged_q4k_nr0_id = false;
+                    if (!s_logged_q4k_nr0_id) {
+                        s_logged_q4k_nr0_id = true;
+                        GGML_LOG_INFO("%s: Q4_K NR0 override (id) = %d\n", __func__, (int) nr0);
                     }
                 }
             } break;
@@ -932,6 +974,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_Q6_K;
                 nr0 = N_R0_Q6_K;
+                // Optional override: rows per threadgroup for Q6_K mat-vec.
+                // export GGML_METAL_Q6K_NR0=128
+                if (const char * env = getenv("GGML_METAL_Q6K_NR0")) {
+                    const int v = atoi(env);
+                    if (v >= 8 && v <= 256) {
+                        nr0 = v;
+                    }
+                    static bool s_logged_q6k_nr0_id = false;
+                    if (!s_logged_q6k_nr0_id) {
+                        s_logged_q6k_nr0_id = true;
+                        GGML_LOG_INFO("%s: Q6_K NR0 override (id) = %d\n", __func__, (int) nr0);
+                    }
+                }
             } break;
         case GGML_TYPE_IQ2_XXS:
             {
