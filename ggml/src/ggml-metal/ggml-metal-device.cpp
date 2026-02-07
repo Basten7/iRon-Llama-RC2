@@ -709,8 +709,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             // Usage: export GGML_METAL_Q4K_NR0=32
             if (const char * env = getenv("GGML_METAL_Q4K_NR0")) {
                 const int v = atoi(env);
-                // keep conservative bounds; values should typically be multiples of 8
-                if (v >= 8 && v <= 256) {
+                // Select only NR0 values that have a dedicated kernel entry point.
+                if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
                     nr0 = v;
                 }
             }
@@ -809,7 +809,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     // a matching kernel entry point (specialized by NR0) to avoid correctness issues.
     if (tsrc0 == GGML_TYPE_Q4_K && getenv("GGML_METAL_Q4K_NR0") != NULL) {
         const int v = nr0;
-        if (v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+        if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
             snprintf(base, 256, "kernel_mul_mv_%s_%s_nr0_%d%s",
                      ggml_type_name(tsrc0), ggml_type_name(tsrc1), v, suffix);
         } else {
@@ -1079,7 +1079,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     // a matching kernel entry point (specialized by NR0) to avoid correctness issues.
     if (tsrc0 == GGML_TYPE_Q4_K && getenv("GGML_METAL_Q4K_NR0") != NULL) {
         const int v = nr0;
-        if (v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+        if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
             snprintf(base, 256, "kernel_mul_mv_id_%s_%s_nr0_%d%s",
                      ggml_type_name(tsrc0), ggml_type_name(tsrc1), v, suffix);
         } else {
