@@ -7349,6 +7349,19 @@ kernel void kernel_mul_mv_q4_K_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 // Q4_K mul_mv variants specialized by NR0 (compile-time), for host-side selection
+[[host_name("kernel_mul_mv_q4_K_f32_nr0_2")]]
+kernel void kernel_mul_mv_q4_K_f32_nr0_2(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_impl<2, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+
 [[host_name("kernel_mul_mv_q4_K_f32_nr0_4")]]
 kernel void kernel_mul_mv_q4_K_f32_nr0_4(
         constant ggml_metal_kargs_mul_mv & args,
@@ -7409,7 +7422,7 @@ kernel void kernel_mul_mv_q4_K_f32_nr0_64(
     kernel_mul_mv_q4_K_f32_impl<64, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
-[[host_name("kernel_mul_mv_q4_K_f32_nr0_28")]]
+[[host_name("kernel_mul_mv_q4_K_f32_nr0_128")]]
 kernel void kernel_mul_mv_q4_K_f32_nr0_128(
         constant ggml_metal_kargs_mul_mv & args,
         device const char * src0,
@@ -9883,7 +9896,7 @@ template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_q4_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <N_R0_Q4_K>>>;
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_4")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <4>>>;
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_8")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <8>>>;
-template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_6")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <16>>>;
+template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_16")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <16>>>;
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <32>>>;
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_64")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <64>>>;
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_128")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <128>>>;
