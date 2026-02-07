@@ -805,7 +805,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             }
     };
 
-    snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+    // Q4_K NR0 is compile-time in the Metal kernel. If the user overrides NR0, the host must select
+    // a matching kernel entry point (specialized by NR0) to avoid correctness issues.
+    if (tsrc0 == GGML_TYPE_Q4_K && getenv("GGML_METAL_Q4K_NR0") != NULL) {
+        const int v = nr0;
+        if (v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+            snprintf(base, 256, "kernel_mul_mv_%s_%s_nr0_%d%s",
+                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), v, suffix);
+        } else {
+            snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+        }
+    } else {
+        snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+    }
     snprintf(name, 256, "%s_nsg=%d", base, nsg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -974,17 +986,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                     }
                 }
                 // Optional override: rows per threadgroup for Q4_K mat-vec.
-                // export GGML_METAL_Q4K_NR0=128
+                // export GGML_METAL_Q4K_NR0=32
                 if (const char * env = getenv("GGML_METAL_Q4K_NR0")) {
                     const int v = atoi(env);
-                    // keep conservative bounds; values should typically be multiples of 8
                     if (v >= 8 && v <= 256) {
                         nr0 = v;
-                    }
-                    static bool s_logged_q4k_nr0_id = false;
-                    if (!s_logged_q4k_nr0_id) {
-                        s_logged_q4k_nr0_id = true;
-                        GGML_LOG_INFO("%s: Q4_K NR0 override (id) = %d\n", __func__, (int) nr0);
                     }
                 }
             } break;
@@ -1069,7 +1075,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             }
     };
 
-    snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+    // Q4_K NR0 is compile-time in the Metal kernel. If the user overrides NR0, the host must select
+    // a matching kernel entry point (specialized by NR0) to avoid correctness issues.
+    if (tsrc0 == GGML_TYPE_Q4_K && getenv("GGML_METAL_Q4K_NR0") != NULL) {
+        const int v = nr0;
+        if (v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+            snprintf(base, 256, "kernel_mul_mv_id_%s_%s_nr0_%d%s",
+                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), v, suffix);
+        } else {
+            snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+        }
+    } else {
+        snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+    }
     snprintf(name, 256, "%s_nsg=%d", base, nsg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
