@@ -1,3 +1,5 @@
+//ggml-metal-device.fixed.cpp le 8/02/2026 à 14-45
+
 #include "ggml-metal-device.h"
 
 #include "ggml-metal-impl.h"
@@ -622,33 +624,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     smem = 32*sizeof(float)*nr0;
                     suffix = ne00 % 4 == 0 ? "_4" : "";
                 }
-                // Optional override: rows per threadgroup for F32/F16 mat-vec (non-short path).
-                // Usage:
-                //   export GGML_METAL_F32_NR0=8
-                //   export GGML_METAL_F16_NR0=8
-                if (strcmp(suffix, "_short") != 0) {
-                    const bool is_f32 = (tsrc0 == GGML_TYPE_F32);
-                    const bool is_f16 = (tsrc0 == GGML_TYPE_F16);
-                    const char * env = is_f32 ? getenv("GGML_METAL_F32_NR0")
-                                     : is_f16 ? getenv("GGML_METAL_F16_NR0")
-                                              : NULL;
-                    if (env) {
-                        const int v = atoi(env);
-                        // keep conservative bounds; large values increase threadgroup memory usage
-                        if (v >= 1 && v <= 256) {
-                            nr0  = v;
-                            smem = 32*sizeof(float)*nr0;
-                        }
-                        static bool s_logged_f32 = false;
-                        static bool s_logged_f16 = false;
-                        bool & s_logged = is_f32 ? s_logged_f32 : s_logged_f16;
-                        if (!s_logged) {
-                            s_logged = true;
-                            GGML_LOG_INFO("%s: %s NR0 override = %d\n",
-                                          __func__, is_f32 ? "F32" : "F16", (int) nr0);
-                        }
-                    }
-                }
             } break;
         case GGML_TYPE_Q4_0:
             {
@@ -693,35 +668,36 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nr0 = N_R0_Q3_K;
             } break;
         case GGML_TYPE_Q4_K:
-        {
-            nsg = N_SG_Q4_K;
-            nr0 = N_R0_Q4_K;
-            // Optional override: more simdgroups per threadgroup for Q4_K mat-vec.
-            // Intended for AMD dGPU (W6800X) tuning without impacting other devices by default.
-            // Usage: export GGML_METAL_Q4K_NSG=4
-            if (const char * env = getenv("GGML_METAL_Q4K_NSG")) {
-                const int v = atoi(env);
-                if (v >= 1 && v <= 8) {
-                    nsg = v;
-                }
-            }
-            // Optional override: rows per threadgroup for Q4_K mat-vec.
-            // Usage: export GGML_METAL_Q4K_NR0=32
-            if (const char * env = getenv("GGML_METAL_Q4K_NR0")) {
-                const int v = atoi(env);
-                // Select only NR0 values that have a dedicated kernel entry point.
-                if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
-                    nr0 = v;
-                }
-            }
             {
-                static bool s_logged_q4k_nr0 = false;
-                if (!s_logged_q4k_nr0 && getenv("GGML_METAL_Q4K_NR0") != NULL) {
-                    s_logged_q4k_nr0 = true;
-                    GGML_LOG_INFO("%s: Q4_K NR0 override = %d\n", __func__, (int) nr0);
+                nsg = N_SG_Q4_K;
+                nr0 = N_R0_Q4_K;
+
+                // Optional override: more simdgroups per threadgroup for Q4_K mat-vec.
+                // Intended for AMD dGPU (W6800X) tuning without impacting other devices by default.
+                // Usage: export GGML_METAL_Q4K_NSG=4
+                if (const char * env = getenv("GGML_METAL_Q4K_NSG")) {
+                    const int v = atoi(env);
+                    if (v >= 1 && v <= 8) {
+                        nsg = v;
+                    }
                 }
-            }
-        } break;
+
+                // Optional override: rows per threadgroup for Q4_K mat-vec.
+                // NOTE: NR0 is compile-time in the Metal kernel. Only values that have a dedicated
+                // kernel entry point are allowed here.
+                // Usage: export GGML_METAL_Q4K_NR0=32
+                if (const char * env = getenv("GGML_METAL_Q4K_NR0")) {
+                    const int v = atoi(env);
+                    if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+                        nr0 = v;
+                    }
+                    static bool s_logged_q4k_nr0 = false;
+                    if (!s_logged_q4k_nr0) {
+                        s_logged_q4k_nr0 = true;
+                        GGML_LOG_INFO("%s: Q4_K NR0 override = %d", __func__, (int) nr0);
+                    }
+                }
+            } break;
         case GGML_TYPE_Q5_K:
             {
                 nsg = N_SG_Q5_K;
@@ -731,19 +707,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q6_K;
                 nr0 = N_R0_Q6_K;
+
                 // Optional override: rows per threadgroup for Q6_K mat-vec.
-                // Intended for AMD dGPU tuning without impacting other devices by default.
+                // NOTE: NR0 is compile-time in the Metal kernel. Only values that have a dedicated
+                // kernel entry point are allowed here.
                 // Usage: export GGML_METAL_Q6K_NR0=128
                 if (const char * env = getenv("GGML_METAL_Q6K_NR0")) {
                     const int v = atoi(env);
-                    // keep conservative bounds; values should typically be multiples of 8
-                    if (v >= 8 && v <= 256) {
+                    if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
                         nr0 = v;
                     }
                     static bool s_logged_q6k_nr0 = false;
                     if (!s_logged_q6k_nr0) {
                         s_logged_q6k_nr0 = true;
-                        GGML_LOG_INFO("%s: Q6_K NR0 override = %d\n", __func__, (int) nr0);
+                        GGML_LOG_INFO("%s: Q6_K NR0 override = %d", __func__, (int) nr0);
                     }
                 }
             } break;
@@ -805,19 +782,38 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             }
     };
 
-    // Q4_K NR0 is compile-time in the Metal kernel. If the user overrides NR0, the host must select
+    // Q4_K/Q6_K NR0 is compile-time in the Metal kernel. If the user overrides NR0, the host must select
     // a matching kernel entry point (specialized by NR0) to avoid correctness issues.
-    if (tsrc0 == GGML_TYPE_Q4_K && getenv("GGML_METAL_Q4K_NR0") != NULL) {
+    const bool has_q4k_nr0_env = getenv("GGML_METAL_Q4K_NR0") != NULL;
+    const bool has_q6k_nr0_env = getenv("GGML_METAL_Q6K_NR0") != NULL;
+
+    if (tsrc0 == GGML_TYPE_Q4_K && has_q4k_nr0_env && nr0 != N_R0_Q4_K) {
         const int v = nr0;
         if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
             snprintf(base, 256, "kernel_mul_mv_%s_%s_nr0_%d%s",
                      ggml_type_name(tsrc0), ggml_type_name(tsrc1), v, suffix);
         } else {
-            snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+            // Unsupported override -> fall back to the default kernel and reset nr0 to the compiled default.
+            nr0 = N_R0_Q4_K;
+            snprintf(base, 256, "kernel_mul_mv_%s_%s%s",
+                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+        }
+    } else if (tsrc0 == GGML_TYPE_Q6_K && has_q6k_nr0_env && nr0 != N_R0_Q6_K) {
+        const int v = nr0;
+        if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+            snprintf(base, 256, "kernel_mul_mv_%s_%s_nr0_%d%s",
+                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), v, suffix);
+        } else {
+            // Unsupported override -> fall back to the default kernel and reset nr0 to the compiled default.
+            nr0 = N_R0_Q6_K;
+            snprintf(base, 256, "kernel_mul_mv_%s_%s%s",
+                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
         }
     } else {
-        snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+        snprintf(base, 256, "kernel_mul_mv_%s_%s%s",
+                 ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
     }
+
     snprintf(name, 256, "%s_nsg=%d", base, nsg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -913,23 +909,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nr1 = 1;
                 smem = 32*sizeof(float)*nr0;
                 suffix = ne00 % 4 == 0 ? "_4" : "";
-                
-                // Optional override for F32/F16 (mul_mv_id path).
-                // Usage:
-                //   export GGML_METAL_F32_NR0=8
-                //   export GGML_METAL_F16_NR0=8
-                const bool is_f32 = (tsrc0 == GGML_TYPE_F32);
-                const bool is_f16 = (tsrc0 == GGML_TYPE_F16);
-                const char * env = is_f32 ? getenv("GGML_METAL_F32_NR0")
-                                 : is_f16 ? getenv("GGML_METAL_F16_NR0")
-                                          : NULL;
-                if (env) {
-                    const int v = atoi(env);
-                    if (v >= 1 && v <= 256) {
-                        nr0  = v;
-                        smem = 32*sizeof(float)*nr0;
-                    }
-                }
             } break;
         case GGML_TYPE_Q4_0:
             {
@@ -977,20 +956,30 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
-                // Optional override (same as main mul_mv path):
-                // export GGML_METAL_Q4K_NSG=4
+
+                // Optional override: more simdgroups per threadgroup for Q4_K mat-vec.
+                // Intended for AMD dGPU (W6800X) tuning without impacting other devices by default.
+                // Usage: export GGML_METAL_Q4K_NSG=4
                 if (const char * env = getenv("GGML_METAL_Q4K_NSG")) {
                     const int v = atoi(env);
                     if (v >= 1 && v <= 8) {
                         nsg = v;
                     }
                 }
+
                 // Optional override: rows per threadgroup for Q4_K mat-vec.
-                // export GGML_METAL_Q4K_NR0=32
+                // NOTE: NR0 is compile-time in the Metal kernel. Only values that have a dedicated
+                // kernel entry point are allowed here.
+                // Usage: export GGML_METAL_Q4K_NR0=32
                 if (const char * env = getenv("GGML_METAL_Q4K_NR0")) {
                     const int v = atoi(env);
-                    if (v >= 8 && v <= 256) {
+                    if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
                         nr0 = v;
+                    }
+                    static bool s_logged_q4k_nr0 = false;
+                    if (!s_logged_q4k_nr0) {
+                        s_logged_q4k_nr0 = true;
+                        GGML_LOG_INFO("%s: Q4_K NR0 override = %d", __func__, (int) nr0);
                     }
                 }
             } break;
@@ -1003,17 +992,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_Q6_K;
                 nr0 = N_R0_Q6_K;
+
                 // Optional override: rows per threadgroup for Q6_K mat-vec.
-                // export GGML_METAL_Q6K_NR0=128
+                // NOTE: NR0 is compile-time in the Metal kernel. Only values that have a dedicated
+                // kernel entry point are allowed here.
+                // Usage: export GGML_METAL_Q6K_NR0=128
                 if (const char * env = getenv("GGML_METAL_Q6K_NR0")) {
                     const int v = atoi(env);
-                    if (v >= 8 && v <= 256) {
+                    if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
                         nr0 = v;
                     }
-                    static bool s_logged_q6k_nr0_id = false;
-                    if (!s_logged_q6k_nr0_id) {
-                        s_logged_q6k_nr0_id = true;
-                        GGML_LOG_INFO("%s: Q6_K NR0 override (id) = %d\n", __func__, (int) nr0);
+                    static bool s_logged_q6k_nr0 = false;
+                    if (!s_logged_q6k_nr0) {
+                        s_logged_q6k_nr0 = true;
+                        GGML_LOG_INFO("%s: Q6_K NR0 override = %d", __func__, (int) nr0);
                     }
                 }
             } break;
@@ -1075,19 +1067,38 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             }
     };
 
-    // Q4_K NR0 is compile-time in the Metal kernel. If the user overrides NR0, the host must select
+    // Q4_K/Q6_K NR0 is compile-time in the Metal kernel. If the user overrides NR0, the host must select
     // a matching kernel entry point (specialized by NR0) to avoid correctness issues.
-    if (tsrc0 == GGML_TYPE_Q4_K && getenv("GGML_METAL_Q4K_NR0") != NULL) {
+    const bool has_q4k_nr0_env = getenv("GGML_METAL_Q4K_NR0") != NULL;
+    const bool has_q6k_nr0_env = getenv("GGML_METAL_Q6K_NR0") != NULL;
+
+    if (tsrc0 == GGML_TYPE_Q4_K && has_q4k_nr0_env && nr0 != N_R0_Q4_K) {
         const int v = nr0;
         if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
             snprintf(base, 256, "kernel_mul_mv_id_%s_%s_nr0_%d%s",
                      ggml_type_name(tsrc0), ggml_type_name(tsrc1), v, suffix);
         } else {
-            snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+            // Unsupported override -> fall back to the default kernel and reset nr0 to the compiled default.
+            nr0 = N_R0_Q4_K;
+            snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s",
+                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+        }
+    } else if (tsrc0 == GGML_TYPE_Q6_K && has_q6k_nr0_env && nr0 != N_R0_Q6_K) {
+        const int v = nr0;
+        if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+            snprintf(base, 256, "kernel_mul_mv_id_%s_%s_nr0_%d%s",
+                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), v, suffix);
+        } else {
+            // Unsupported override -> fall back to the default kernel and reset nr0 to the compiled default.
+            nr0 = N_R0_Q6_K;
+            snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s",
+                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
         }
     } else {
-        snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+        snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s",
+                 ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
     }
+
     snprintf(name, 256, "%s_nsg=%d", base, nsg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
