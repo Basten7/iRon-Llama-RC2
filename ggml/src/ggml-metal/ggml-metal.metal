@@ -3841,16 +3841,10 @@ void kernel_mul_mv_t_t_disp(
         ushort tiisg,
         ushort sgitg) {
     switch (args.nr0) {
-        case 1: kernel_mul_mv_t_t_impl<T0, T1, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+      //case 1: kernel_mul_mv_t_t_impl<T0, T1, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
         case 2: kernel_mul_mv_t_t_impl<T0, T1, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 4: kernel_mul_mv_t_t_impl<T0, T1, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 8: kernel_mul_mv_t_t_impl<T0, T1, 8, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 16: kernel_mul_mv_t_t_impl<T0, T1, 16, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 32: kernel_mul_mv_t_t_impl<T0, T1, 32, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 64: kernel_mul_mv_t_t_impl<T0, T1, 64, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 128: kernel_mul_mv_t_t_impl<T0, T1, 128, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 256: kernel_mul_mv_t_t_impl<T0, T1, 256, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        default: break;
+      //case 3: kernel_mul_mv_t_t_impl<T0, T1, 3, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+      //case 4: kernel_mul_mv_t_t_impl<T0, T1, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
     }
 }
 
@@ -3971,16 +3965,10 @@ void kernel_mul_mv_t_t_4_disp(
         ushort tiisg,
         ushort sgitg) {
     switch (args.nr0) {
-        case 1: kernel_mul_mv_t_t_impl<T0, T1, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 2: kernel_mul_mv_t_t_impl<T0, T1, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 4: kernel_mul_mv_t_t_impl<T0, T1, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 8: kernel_mul_mv_t_t_impl<T0, T1, 8, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 16: kernel_mul_mv_t_t_impl<T0, T1, 16, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 32: kernel_mul_mv_t_t_impl<T0, T1, 32, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 64: kernel_mul_mv_t_t_impl<T0, T1, 64, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 128: kernel_mul_mv_t_t_impl<T0, T1, 128, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 256: kernel_mul_mv_t_t_impl<T0, T1, 256, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        default: break;
+      //case 1: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+      //case 3: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 3, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+      //case 4: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
     };
 }
 
@@ -7225,7 +7213,6 @@ kernel void kernel_mul_mv_q3_K_f32(
 }
 
 template<int nr0, typename args_t>
-
 void kernel_mul_mv_q4_K_f32_impl(
         args_t args,
         device const char * src0,
@@ -7613,7 +7600,6 @@ void kernel_mul_mv_q6_K_f32_impl(
     const int im = tgpig.z;
 
     const int first_row = (r0 * NSG + sgitg) * nr0;
-    
     // Prevent out-of-bounds reads from src0 for tail threadgroups when NR0 is overridden.
     // Without this, some NR0 values can produce incorrect output due to invalid src0 reads.
     if (first_row >= args.ne0) {
@@ -7662,8 +7648,9 @@ void kernel_mul_mv_q6_K_f32_impl(
         for (short row = 0; row < nr0; ++row) {
             // Stop before accessing rows outside the matrix height (prevents invalid src0 reads)
             if (first_row + row >= args.ne0) {
-                break;
-            }            float4 sums = {0.f, 0.f, 0.f, 0.f};
+                 break;
+            }
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
 
             FOR_UNROLL (short l = 0; l < 4; ++l) {
                 sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
@@ -7704,7 +7691,6 @@ kernel void kernel_mul_mv_q6_K_f32(
 
     kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
-
 // Q6_K mul_mv variants specialized by NR0 (compile-time), for host-side selection
 [[host_name("kernel_mul_mv_q6_K_f32_nr0_2")]]
 kernel void kernel_mul_mv_q6_K_f32_nr0_2(
@@ -7801,6 +7787,7 @@ kernel void kernel_mul_mv_q6_K_f32_nr0_256(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q6_K_f32_impl<256, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
+
 // ======================= "True" 2-bit
 
 template<int nr0, typename args_t>
@@ -10010,15 +9997,34 @@ template [[host_name("kernel_mul_mv_id_mxfp4_f32")]]   kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
 template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;
 template [[host_name("kernel_mul_mv_id_q4_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <N_R0_Q4_K>>>;
+#if N_R0_Q4_K != 2
+template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_2")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <2>>>;
+#endif
+#if N_R0_Q4_K != 4
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_4")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <4>>>;
+#endif
+#if N_R0_Q4_K != 8
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_8")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <8>>>;
+#endif
+#if N_R0_Q4_K != 16
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_16")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <16>>>;
+#endif
+#if N_R0_Q4_K != 32
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <32>>>;
+#endif
+#if N_R0_Q4_K != 64
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_64")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <64>>>;
+#endif
+#if N_R0_Q4_K != 128
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_128")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <128>>>;
+#endif
+#if N_R0_Q4_K != 256
 template [[host_name("kernel_mul_mv_id_q4_K_f32_nr0_256")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <256>>>;
+#endif
 template [[host_name("kernel_mul_mv_id_q5_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q5_K_f32_impl   <N_R0_Q5_K>>>;
-template [[host_name("kernel_mul_mv_id_q6_K_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K>>>;
+// Q6_K default (uses N_R0_Q6_K)
+template [[host_name("kernel_mul_mv_id_q6_K_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K>>>;
+// Q6_K explicit NR0 variants (guarded against N_R0_Q6_K == NR0)
 #if N_R0_Q6_K != 2
 template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_2")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<2>>>;
 #endif
@@ -10029,21 +10035,20 @@ template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_4")]]   kernel kernel_mul_mv
 template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_8")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<8>>>;
 #endif
 #if N_R0_Q6_K != 16
-template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_16")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<16>>>;
+template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_16")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<16>>>;
 #endif
 #if N_R0_Q6_K != 32
-template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<32>>>;
+template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<32>>>;
 #endif
 #if N_R0_Q6_K != 64
-template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_64")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<64>>>;
+template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_64")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<64>>>;
 #endif
 #if N_R0_Q6_K != 128
-template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_128")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<128>>>;
+template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_128")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<128>>>;
 #endif
 #if N_R0_Q6_K != 256
-template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_256")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<256>>>;
+template [[host_name("kernel_mul_mv_id_q6_K_f32_nr0_256")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl<256>>>;
 #endif
-
 template [[host_name("kernel_mul_mv_id_iq1_s_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq1_s_f32_impl  <N_R0_IQ1_S>>>;
 template [[host_name("kernel_mul_mv_id_iq1_m_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq1_m_f32_impl  <N_R0_IQ1_M>>>;
 template [[host_name("kernel_mul_mv_id_iq2_xxs_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_xxs_f32_impl<N_R0_IQ2_XXS>>>;

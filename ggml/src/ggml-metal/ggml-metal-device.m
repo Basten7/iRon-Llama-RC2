@@ -654,8 +654,7 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                             selected = true;
                             GGML_LOG_INFO("%s: using device index %ld from GGML_METAL_DEVICE_INDEX\n", __func__, idx);
                         } else {
-                            GGML_LOG_WARN("%s: GGML_METAL_DEVICE_INDEX=%ld out of range (devices=%lu), using default device\n",
-                                          __func__, idx, (unsigned long) [devices count]);
+                            GGML_LOG_WARN("%s: GGML_METAL_DEVICE_INDEX=%ld out of range (devices=%lu), using default device\n", __func__, idx, (unsigned long) [devices count]);
                         }
                     } else {
                         GGML_LOG_WARN("%s: invalid GGML_METAL_DEVICE_INDEX='%s', using default device\n", __func__, env_dev_index);
@@ -909,9 +908,7 @@ ggml_metal_device_t ggml_metal_device_init(void) {
             GGML_LOG_INFO("%s: use shared buffers    = %s\n", __func__, dev->props.use_shared_buffers      ? "true" : "false");
 
 #if TARGET_OS_OSX || (TARGET_OS_IOS && __clang_major__ >= 15)
-            if (@available(macOS 10.12, iOS 16.0, *)) {
-                GGML_LOG_INFO("%s: recommendedMaxWorkingSetSize  = %8.2f MB\n", __func__, dev->props.max_working_set_size / 1e6);
-            }
+            if (@available(macOS 10.12, iOS 16.0, *)) {GGML_LOG_INFO("%s: recommendedMaxWorkingSetSize  = %8.2f MB\n", __func__, dev->props.max_working_set_size / 1e6);}
 #endif
         }
     }
