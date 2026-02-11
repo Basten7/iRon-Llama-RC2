@@ -368,14 +368,30 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
         [cmd_buf retain];
     }
 }
-
+// decode: force single CB/CE option via env GGML_METAL_DECODE_1CB=1
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = 64;
 
     // number of threads in addition to the main thread
-    const int n_cb = ctx->n_cb;
-
+    //const int n_cb = ctx->n_cb;
+    int n_cb = ctx->n_cb;
+    
+    // Force "1 CommandBuffer per decode" (and therefore 1 encoder) when requested.
+    // We keep it opt-in to avoid impacting prefill/batch cases unless you want it.
+    //
+    // Usage:
+    //   export GGML_METAL_DECODE_1CB=1
+    //
+    // Heuristic: if enabled, apply when gf is small-batch/token-like or when concurrency is disabled.
+    // (decode in llama.cpp typically runs with use_concurrency=false already.)
+    const bool force_decode_1cb = (getenv("GGML_METAL_DECODE_1CB") != NULL);
+    if (force_decode_1cb) {
+        // Forcing n_cb=0 guarantees:
+        // - exactly 1 MTLCommandBuffer
+        // - exactly 1 ggml_metal_op instance => 1 MTLComputeCommandEncoder
+        n_cb = 0;
+    }
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
 

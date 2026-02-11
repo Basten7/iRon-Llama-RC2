@@ -1684,63 +1684,96 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
         }
 
         [cmd_buf commit];
-        [cmd_buf waitUntilCompleted];
+        //[cmd_buf waitUntilCompleted]; //Remove waits from memset / clear (also safe) TOTO
     }
 }
 
-void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+//void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+//    if (buf->is_shared) {
+//        memcpy((char *) tensor->data + offset, data, size);
+//        return;
+//    }
+//
+//    @autoreleasepool {
+//        // src
+//        void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
+//        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
+//                                                               length:size
+//                                                              options:MTLResourceStorageModeShared
+//                                                          deallocator:nil];
+//
+//        GGML_ASSERT(buf_src);
+//
+//        // dst
+//        struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
+//        bid_dst.offs += offset;
+//
+//        // note: for experimentation purposes, here we use a semaphore to wait for the copy to complete
+//        //       this is alternative to waitUntilCompleted, which should be faster, but don't seem to make much difference
+//        dispatch_semaphore_t completion_semaphore = dispatch_semaphore_create(0);
+//
+//        id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+//
+//        {
+//            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+//
+//            [encoder copyFromBuffer:buf_src
+//                       sourceOffset:0
+//                           toBuffer:bid_dst.metal
+//                  destinationOffset:bid_dst.offs
+//                               size:size];
+//
+//            [encoder endEncoding];
+//        }
+//
+//        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+//                             // TODO: can check for errors here
+//            GGML_UNUSED(cb);
+//
+//            dispatch_semaphore_signal(completion_semaphore);
+//        }];
+//
+//        [cmd_buf commit];
+//
+//        dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
+//        dispatch_release(completion_semaphore);
+//
+//        //[cmd_buf waitUntilCompleted];
+//    }
+//}
+//TOTO
+void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor,
+                                 const void * data, size_t offset, size_t size) {
     if (buf->is_shared) {
         memcpy((char *) tensor->data + offset, data, size);
         return;
     }
 
     @autoreleasepool {
-        // src
-        void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
-
+        // src: COPY the bytes so caller memory lifetime doesn't matter
+        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytes:data
+                                                                  length:size
+                                                                 options:MTLResourceStorageModeShared];
         GGML_ASSERT(buf_src);
 
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
         bid_dst.offs += offset;
 
-        // note: for experimentation purposes, here we use a semaphore to wait for the copy to complete
-        //       this is alternative to waitUntilCompleted, which should be faster, but don't seem to make much difference
-        dispatch_semaphore_t completion_semaphore = dispatch_semaphore_create(0);
-
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 
-        {
-            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-
-            [encoder copyFromBuffer:buf_src
-                       sourceOffset:0
-                           toBuffer:bid_dst.metal
-                  destinationOffset:bid_dst.offs
-                               size:size];
-
-            [encoder endEncoding];
-        }
-
-        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-                             // TODO: can check for errors here
-            GGML_UNUSED(cb);
-
-            dispatch_semaphore_signal(completion_semaphore);
-        }];
+        id<MTLBlitCommandEncoder> enc = [cmd_buf blitCommandEncoder];
+        [enc copyFromBuffer:buf_src sourceOffset:0
+                   toBuffer:bid_dst.metal destinationOffset:bid_dst.offs
+                       size:size];
+        [enc endEncoding];
 
         [cmd_buf commit];
-
-        dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
-        dispatch_release(completion_semaphore);
-
-        //[cmd_buf waitUntilCompleted];
+        // NO WAIT: the compute command buffers enqueued/committed after this on the same queue
+        // will naturally execute after the blit.
     }
 }
+
 
 void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     if (buf->is_shared) {
@@ -1800,7 +1833,7 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
         }
 
         [cmd_buf commit];
-        [cmd_buf waitUntilCompleted];
+        //[cmd_buf waitUntilCompleted];// Remove waits from memset / clear (also safe) TOTO
     }
 }
 
