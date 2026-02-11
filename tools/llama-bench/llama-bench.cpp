@@ -1997,15 +1997,28 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
 
     llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
 
+    // Metal and other GPU backends can run command buffers asynchronously.
+    // Synchronizing every token forces a CPU/GPU rendezvous and severely hurts tg performance.
+    // Instead, let work queue up and sync periodically + once at the end to keep memory bounded
+    // and ensure correctness for timing.
+    const int sync_every = 32;
+
     for (int i = 0; i < n_gen; i++) {
-        int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
+        const int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
             return false;
         }
-        llama_synchronize(ctx);
+
+        if (sync_every > 0 && ((i + 1) % sync_every) == 0) {
+            llama_synchronize(ctx);
+        }
+
         token = std::rand() % n_vocab;
     }
+
+    llama_synchronize(ctx);
+
     return true;
 }
 

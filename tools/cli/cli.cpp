@@ -64,7 +64,7 @@ struct cli_context {
         defaults.antiprompt  = params.antiprompt;
 
         defaults.stream = true; // make sure we always use streaming mode
-        defaults.timings_per_token = true; // in order to get timings even when we cancel mid-way
+        defaults.timings_per_token = false; // default: avoid per-token GPU sync stalls (enable with --timings-per-token)
         // defaults.return_progress = true; // TODO: show progress
     }
 
