@@ -1119,7 +1119,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         default:
             {
-                GGML_LOG_ERROR("Asserting on type %d\n", (int)op->src[2]->type);
+                //GGML_LOG_ERROR("Asserting on type %d\n", (int)op->src[2]->type); TOTO
+                GGML_LOG_ERROR("Asserting on type %d\n", (int)tsrc0);
+
                 GGML_ABORT("not implemented");
             }
     };
@@ -1540,10 +1542,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
 
         ggml_metal_cv_free(cv);
     }
-
+    GGML_UNUSED(op);
     return res;
 
-    GGML_UNUSED(op);
+
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(
