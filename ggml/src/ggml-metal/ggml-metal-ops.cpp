@@ -2290,14 +2290,13 @@ size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
 
     const bool is_vec = ggml_metal_op_flash_attn_ext_use_vec(op);
 
-    // this optimization is not useful for the vector kernels
-    // note: always reserve the blk buffer to avoid graph reallocations
-    //if (is_vec) {
-    //    return res;
-    //}
-
-    const int nqptg = is_vec ? OP_FLASH_ATTN_EXT_VEC_NQPTG : OP_FLASH_ATTN_EXT_NQPTG;
-    const int ncpsg = is_vec ? OP_FLASH_ATTN_EXT_VEC_NCPSG : OP_FLASH_ATTN_EXT_NCPSG;
+    // Always reserve the non-vec blk buffer size.
+    // Rationale:
+    // - vector kernels do not use this optimization in practice
+    // - runtime kernel selection may force the non-vec path (e.g. on AMD),
+    //   so reserving the non-vec size avoids under-allocation.
+    const int nqptg = OP_FLASH_ATTN_EXT_NQPTG;
+    const int ncpsg = OP_FLASH_ATTN_EXT_NCPSG;
 
     const int64_t ne1 = (ne01 + nqptg - 1)/nqptg;
     const int64_t ne0 = (ne30 + ncpsg - 1)/ncpsg;
@@ -2410,7 +2409,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_tmp = bid_blk;
     bid_tmp.offs += ggml_metal_op_flash_attn_ext_extra_blk(op);
 
-    if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
+    const bool use_vec =
+    ggml_metal_op_flash_attn_ext_use_vec(op) &&
+    !ggml_metal_device_is_amd(ctx->dev);
+    
+    if (!use_vec) {
         // half8x8 kernel
         const int nqptg = OP_FLASH_ATTN_EXT_NQPTG; // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_NCPSG; // cache values per simdgroup
@@ -2521,9 +2524,30 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         // simdgroups per threadgroup (a.k.a. warps)
         //nsg = ne01 <= nqptg ? MAX(4, MIN(nsgmax, MIN(ne11/ncpsg, (int64_t) pipeline.maxTotalThreadsPerThreadgroup/32))) : 4;
-        int32_t nsg = ne00 >= 512 ? 8 : 4;
-
-        const size_t smem = FATTN_SMEM(nsg);
+        int32_t nsg = 4;
+        
+        // AMD tuning:
+        // Prefer nsg = 8 when threadgroup memory allows it and the KV cache is large enough
+        // to keep more simdgroups busy. Keep the previous heuristic for non-AMD.
+        if (ggml_metal_device_is_amd(ctx->dev)) {
+            const bool kv_large = ne11 >= 8*ncpsg;
+            const size_t smem8 = FATTN_SMEM(8);
+        
+            // Avoid using more than half of the threadgroup memory. Excessive TG memory usage
+            // can cause slowdowns on some devices.
+            if (kv_large && smem8 <= props_dev->max_theadgroup_memory_size/2) {
+                nsg = 8;
+            }
+        } else {
+            nsg = ne00 >= 512 ? 8 : 4;
+        }
+        
+        size_t smem = FATTN_SMEM(nsg);
+        if (smem > props_dev->max_theadgroup_memory_size) {
+            nsg = 4;
+            smem = FATTN_SMEM(nsg);
+        }
+        GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
         ggml_metal_kargs_flash_attn_ext args = {
             /*.ne01          =*/ ne01,
