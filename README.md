@@ -61,24 +61,13 @@ export GGML_METAL_CONCURRENCY_DISABLE=1
 
 
 ### 📦 Installation
-```bash
-git clone https://github.com/ggerganov/llama.cpp.git
-cd llama.cpp
-git fetch --tags
-git checkout 7833
-```
 
 ```bash
 git clone https://github.com/Basten7/iRon-Llama-RC1.git
 cd iRon-Llama-RC1
 ```
 
-### 📦 Patch 
-➡️ Then replace the 3 modified files from this repo into:
-llama.cpp/ggml/src/ggml-metal/      … and you’re done ✅
-```bash
-Copy the 3 files (ggml-metal-device.m ggml-metal-context.m ggml-metal-ops.cpp) into a fresh llama.cpp repo and replace the files in /ggml/src/ggml-metal/ -j
-```
+### 📦 Build for MacOS + Metal V3 
 
 ## ➡️ Prerequisites (Metal-only build)
 ```bash
@@ -93,7 +82,7 @@ brew install cmake git libomp glslang molten-vk shaderc vulkan-loader vulkan-hea
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL_MGPU=ON -DOpenMP_ROOT="$(brew --prefix)/opt/libomp" && cmake --build build -j
 ```
 
-## Quick Validation
+## 📦 Quick Validation
 
 ### 1) Verify GPU selection
 
@@ -218,6 +207,50 @@ Observed behavior on this setup:
 - Some concurrency paths on discrete GPUs can cause non-deterministic outputs; this repo defaults to stable behavior via recommended env vars.
 
 ---
+#RC2  Support for Flash Attention
+
+./build/bin/llama-bench -ngl 99 --mmap 0 -m ~/Models/Qwen3-Coder-30B-A3B-Instruct-1M-Q4_K_S.gguf  -fa 1,0
+
+ggml_metal_device_init: using device index 2 from GGML_METAL_DEVICE_INDEX
+
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+
+ggml_metal_library_init: using embedded metal library
+
+ggml_metal_library_init: loaded in 0.038 sec
+
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+
+ggml_metal_device_init: GPU name:   AMD Radeon PRO W6800X Duo
+
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal3  (5001)
+
+ggml_metal_device_init: simdgroup reduction   = true
+
+ggml_metal_device_init: simdgroup matrix mul. = false
+
+ggml_metal_device_init: has unified memory    = false
+
+ggml_metal_device_init: has bfloat            = false
+
+ggml_metal_device_init: has tensor            = false
+
+ggml_metal_device_init: use residency sets    = true
+
+ggml_metal_device_init: use shared buffers    = false
+
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 34342.96 MB
+
+| model                          |       size |     params | backend    | threads | fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | -: | --------------: | -------------------: |
+| qwen3moe 30B.A3B Q4_K - Small  |  16.25 GiB |    30.53 B | Metal,BLAS |      12 |  1 |           pp512 |        255.73 ± 0.08 |
+| qwen3moe 30B.A3B Q4_K - Small  |  16.25 GiB |    30.53 B | Metal,BLAS |      12 |  1 |           tg128 |         72.25 ± 0.42 |
+| qwen3moe 30B.A3B Q4_K - Small  |  16.25 GiB |    30.53 B | Metal,BLAS |      12 |  0 |           pp512 |        189.06 ± 0.03 |
+| qwen3moe 30B.A3B Q4_K - Small  |  16.25 GiB |    30.53 B | Metal,BLAS |      12 |  0 |           tg128 |         76.96 ± 0.16 |
+
+build: a85804025 (7926)
 
 ## License
 
