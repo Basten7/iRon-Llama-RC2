@@ -521,22 +521,26 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
 
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
-
+    
     // a single global queue shared by all Metal backends
     // technically not needed for devices with unified memory, but enables discrete GPUs support
     // ref: https://github.com/ggml-org/llama.cpp/pull/15906
     id<MTLCommandQueue> mtl_queue;
-
+    
     ggml_metal_rsets_t rsets;
-
+    
     ggml_metal_library_t library;
-
+    
     struct ggml_metal_device_props props;
-
+    
     // VRAM budget tracking for private (StorageModePrivate) mirrors on discrete GPUs
     size_t vram_private_budget;
     size_t vram_private_allocated;
-};
+    // Upload pacing / correctness (mainly for AMD discrete GPUs)
+    // We commit one blit CB per tensor but only fence every "chunk" of uploaded bytes.
+    size_t upload_bytes_accum;
+    size_t upload_chunk_bytes;
+    bool   upload_need_sync;};
 
 //
 // MTLResidenceSet wrapper
@@ -879,7 +883,23 @@ ggml_metal_device_t ggml_metal_device_init(void) {
 
             // print MTL GPU family:
             GGML_LOG_INFO("%s: GPU name:   %s\n", __func__, dev->props.name);
-
+            // Upload sync configuration:
+            // - default: on AMD, fence every 128 MiB of uploaded tensor bytes
+            // - override with GGML_METAL_UPLOAD_CHUNK_MB (0 disables periodic fences)
+            // - force sync on all devices with GGML_METAL_SYNC_UPLOAD
+            {
+                const bool is_amd = ggml_metal_device_is_amd(dev);
+                const char * env_chunk_mb = getenv("GGML_METAL_UPLOAD_CHUNK_MB");
+            
+                size_t chunk_mb = is_amd ? (size_t) 128 : (size_t) 0;
+                if (env_chunk_mb && env_chunk_mb[0]) {
+                    chunk_mb = (size_t) strtoull(env_chunk_mb, NULL, 10);
+                }
+            
+                dev->upload_bytes_accum = 0;
+                dev->upload_chunk_bytes = chunk_mb * (size_t) 1024 * (size_t) 1024;
+                dev->upload_need_sync   = is_amd || (getenv("GGML_METAL_SYNC_UPLOAD") != NULL);
+            }
             // determine max supported GPU family
             // https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
             // https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
@@ -1727,60 +1747,152 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
     }
 }
 
-//void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+
+//void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor,
+//                                 const void * data, size_t offset, size_t size) {
 //    if (buf->is_shared) {
 //        memcpy((char *) tensor->data + offset, data, size);
 //        return;
 //    }
 //
 //    @autoreleasepool {
-//        // src
-//        void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
-//        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
-//                                                               length:size
-//                                                              options:MTLResourceStorageModeShared
-//                                                          deallocator:nil];
-//
+//        // On AMD macOS drivers, async uploads + newBufferWithBytes can lead to incoherent weights.
+//        // Use staging newBufferWithLength + memcpy, and (optionally) fence on completion.
+//        const bool need_sync =
+//        ggml_metal_device_is_amd(buf->dev) ||
+//        (getenv("GGML_METAL_SYNC_UPLOAD") != NULL);
+//        
+//        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithLength:size
+//                                                                         options:MTLResourceStorageModeShared];
 //        GGML_ASSERT(buf_src);
-//
+//        memcpy([buf_src contents], data, size);
+//        
 //        // dst
 //        struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
 //        bid_dst.offs += offset;
 //
-//        // note: for experimentation purposes, here we use a semaphore to wait for the copy to complete
-//        //       this is alternative to waitUntilCompleted, which should be faster, but don't seem to make much difference
-//        dispatch_semaphore_t completion_semaphore = dispatch_semaphore_create(0);
+//        id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+//
+//        id<MTLBlitCommandEncoder> enc = [cmd_buf blitCommandEncoder];
+//        [enc copyFromBuffer:buf_src sourceOffset:0
+//                   toBuffer:bid_dst.metal destinationOffset:bid_dst.offs
+//                       size:size];
+//        [enc endEncoding];
+//
+//        dispatch_semaphore_t sem = NULL;
+//        if (need_sync) {
+//            sem = dispatch_semaphore_create(0);
+//            GGML_ASSERT(sem);
+//        }
+//        
+//        // Keep buf_src alive until GPU finished consuming it, then release.
+//        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+//            if (cb.error) {
+//                GGML_ABORT("ggml_metal_buffer_set_tensor: blit failed: %s",
+//                           cb.error.localizedDescription.UTF8String);
+//            }
+//            [buf_src release];
+//            if (sem) {
+//                dispatch_semaphore_signal(sem);
+//            }
+//        }];
+//        
+//        [cmd_buf commit];
+//        
+//        if (sem) {
+//            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+//            dispatch_release(sem);
+//        }
+//    }
+//}
+//
+//
+//void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+//    if (buf->is_shared) {
+//        memcpy(data, (const char *) tensor->data + offset, size);
+//        return;
+//    }
+//
+//    @autoreleasepool {
+//        // src
+//        struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
+//        bid_src.offs += offset;
+//
+//        // dst
+//        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
+//                                                               length:size
+//                                                              options:MTLResourceStorageModeShared
+//                                                          deallocator:nil];
+//
+//        GGML_ASSERT(buf_dst);
 //
 //        id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 //
 //        {
 //            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 //
-//            [encoder copyFromBuffer:buf_src
-//                       sourceOffset:0
-//                           toBuffer:bid_dst.metal
-//                  destinationOffset:bid_dst.offs
+//            [encoder copyFromBuffer:bid_src.metal
+//                       sourceOffset:bid_src.offs
+//                           toBuffer:buf_dst
+//                  destinationOffset:0
 //                               size:size];
 //
 //            [encoder endEncoding];
 //        }
 //
-//        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-//                             // TODO: can check for errors here
-//            GGML_UNUSED(cb);
-//
-//            dispatch_semaphore_signal(completion_semaphore);
-//        }];
-//
 //        [cmd_buf commit];
-//
-//        dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
-//        dispatch_release(completion_semaphore);
-//
-//        //[cmd_buf waitUntilCompleted];
+//        [cmd_buf waitUntilCompleted];
 //    }
 //}
-//TOTO
+void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor,
+                                 void * data, size_t offset, size_t size) {
+    GGML_ASSERT(buf != NULL);
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(data != NULL);
+
+    if (buf->is_shared) {
+        memcpy(data, (const char *) tensor->data + offset, size);
+        return;
+    }
+
+    @autoreleasepool {
+        // src (private mirror)
+        struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
+        bid_src.offs += offset;
+
+        // dst (shared staging for CPU readback)
+        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithLength:size
+                                                                  options:MTLResourceStorageModeShared];
+        GGML_ASSERT(buf_dst);
+
+        id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+
+        id<MTLBlitCommandEncoder> enc = [cmd_buf blitCommandEncoder];
+        [enc copyFromBuffer:bid_src.metal sourceOffset:bid_src.offs
+                   toBuffer:buf_dst      destinationOffset:0
+                       size:size];
+        [enc endEncoding];
+
+        // We must wait: caller expects 'data' filled when we return.
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        GGML_ASSERT(sem);
+
+        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            if (cb.error) {
+                GGML_ABORT("ggml_metal_buffer_get_tensor: blit failed: %s",
+                           cb.error.localizedDescription.UTF8String);
+            }
+            dispatch_semaphore_signal(sem);
+        }];
+
+        [cmd_buf commit];
+        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        dispatch_release(sem);
+
+        memcpy(data, [buf_dst contents], size);
+        [buf_dst release];
+    }
+}
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor,
                                  const void * data, size_t offset, size_t size) {
     if (buf->is_shared) {
@@ -1789,17 +1901,46 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 
     @autoreleasepool {
-        // On AMD macOS drivers, async uploads + newBufferWithBytes can lead to incoherent weights.
-        // Use staging newBufferWithLength + memcpy, and (optionally) fence on completion.
-        const bool need_sync =
-        ggml_metal_device_is_amd(buf->dev) ||
-        (getenv("GGML_METAL_SYNC_UPLOAD") != NULL);
-        
+        // --- Sync policy (AMD correctness without per-tensor wait) ---
+        // GGML_METAL_SYNC_UPLOAD=1        -> wait for every tensor upload (legacy/debug)
+        // GGML_METAL_UPLOAD_CHUNK_MB=<N>  -> on AMD, wait every N MiB (default 128)
+        // chunk=0                         -> no periodic waits (not recommended on AMD if you saw incoherence)
+
+        static ggml_metal_device_t s_dev = NULL;
+        static bool   s_is_amd = false;
+        static size_t s_accum_bytes = 0;
+        static size_t s_chunk_bytes = 0;
+
+        const bool force_sync = (getenv("GGML_METAL_SYNC_UPLOAD") != NULL);
+
+        // Recompute per-device (in case multiple GPUs / device switches)
+        if (s_dev != buf->dev) {
+            s_dev = buf->dev;
+            s_is_amd = ggml_metal_device_is_amd(buf->dev);
+            s_accum_bytes = 0;
+
+            size_t chunk_mb = 0;
+            if (s_is_amd && !force_sync) {
+                const char * env_chunk_mb = getenv("GGML_METAL_UPLOAD_CHUNK_MB");
+                chunk_mb = 128; // default AMD
+                if (env_chunk_mb && env_chunk_mb[0]) {
+                    chunk_mb = (size_t) strtoull(env_chunk_mb, NULL, 10);
+                }
+            }
+            s_chunk_bytes = chunk_mb * (size_t) 1024 * (size_t) 1024;
+        }
+
+        const bool chunked_sync = (s_is_amd && !force_sync && s_chunk_bytes > 0);
+        const bool do_wait =
+            force_sync ||
+            (chunked_sync && (s_accum_bytes + size >= s_chunk_bytes));
+
+        // --- Staging src buffer (robust on AMD) ---
         id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithLength:size
-                                                                         options:MTLResourceStorageModeShared];
+                                                                  options:MTLResourceStorageModeShared];
         GGML_ASSERT(buf_src);
         memcpy([buf_src contents], data, size);
-        
+
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
         bid_dst.offs += offset;
@@ -1813,12 +1954,12 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         [enc endEncoding];
 
         dispatch_semaphore_t sem = NULL;
-        if (need_sync) {
+        if (do_wait) {
             sem = dispatch_semaphore_create(0);
             GGML_ASSERT(sem);
         }
-        
-        // Keep buf_src alive until GPU finished consuming it, then release.
+
+        // Keep buf_src alive until the GPU finished consuming it.
         [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             if (cb.error) {
                 GGML_ABORT("ggml_metal_buffer_set_tensor: blit failed: %s",
@@ -1829,54 +1970,19 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
                 dispatch_semaphore_signal(sem);
             }
         }];
-        
+
         [cmd_buf commit];
-        
+
         if (sem) {
             dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
             dispatch_release(sem);
+            s_accum_bytes = 0;
+        } else if (chunked_sync) {
+            s_accum_bytes += size;
         }
     }
 }
 
-
-void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    if (buf->is_shared) {
-        memcpy(data, (const char *) tensor->data + offset, size);
-        return;
-    }
-
-    @autoreleasepool {
-        // src
-        struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
-        bid_src.offs += offset;
-
-        // dst
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
-
-        GGML_ASSERT(buf_dst);
-
-        id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
-
-        {
-            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-
-            [encoder copyFromBuffer:bid_src.metal
-                       sourceOffset:bid_src.offs
-                           toBuffer:buf_dst
-                  destinationOffset:0
-                               size:size];
-
-            [encoder endEncoding];
-        }
-
-        [cmd_buf commit];
-        [cmd_buf waitUntilCompleted];
-    }
-}
 
 void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     if (buf->is_shared) {
