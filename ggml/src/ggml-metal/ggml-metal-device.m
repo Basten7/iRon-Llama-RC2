@@ -688,7 +688,14 @@ ggml_metal_device_t ggml_metal_device_init(void) {
             if (getenv("GGML_METAL_BF16_DISABLE") != NULL) {
                 dev->props.has_bfloat = false;
             }
-
+            
+            // On Intel macOS (x86_64), BF16 is not usable end-to-end (no Apple Silicon BF16 ops).
+            // Even if Metal reports BF16 capability, allowing BF16 can route parts of the graph to CPU.
+            #if defined(__x86_64__)
+                        if (getenv("GGML_METAL_BF16_ENABLE") == NULL) {
+                            dev->props.has_bfloat = false;
+                        }
+            #endif
             dev->props.has_tensor = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal4_GGML];
             if (getenv("GGML_METAL_TENSOR_DISABLE") != NULL) {
                 dev->props.has_tensor = false;
@@ -1009,9 +1016,14 @@ bool ggml_metal_device_is_amd(ggml_metal_device_t dev) {
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
-    const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
-    const bool has_bfloat              = dev->props.has_bfloat;
+    bool has_bfloat              = dev->props.has_bfloat;
+
+#if defined(__APPLE__) && defined(__x86_64__)
+    // On Intel macOS, BF16 paths in Metal are not reliable across drivers/toolchains.
+    // Force-disable BF16 to avoid CPU fallbacks and Metal compilation issues.
+    has_bfloat = false;
+#endif
 
     if (!has_bfloat) {
         if (op->type == GGML_TYPE_BF16) {
@@ -1147,25 +1159,52 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ARANGE:
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
-            // for new head sizes, add checks here
-            if (op->src[0]->ne[0] != 32 &&
-                op->src[0]->ne[0] != 40 &&
-                op->src[0]->ne[0] != 48 &&
-                op->src[0]->ne[0] != 64 &&
-                op->src[0]->ne[0] != 72 &&
-                op->src[0]->ne[0] != 80 &&
-                op->src[0]->ne[0] != 96 &&
-                op->src[0]->ne[0] != 112 &&
-                op->src[0]->ne[0] != 128 &&
-                op->src[0]->ne[0] != 192 &&
-                op->src[0]->ne[0] != 256 &&
-                op->src[0]->ne[0] != 576) {
-                return false;
+            {
+                // NOTE: Metal FlashAttention kernels work on AMD even without simdgroup matrix instructions.
+                // Keep checks strict enough to match ggml-metal-ops.cpp expectations.
+                if (op->src[0] == NULL || op->src[1] == NULL || op->src[2] == NULL) {
+                    return false;
+                }
+
+                // for new head sizes, add checks here
+                if (op->src[0]->ne[0] != 32 &&
+                    op->src[0]->ne[0] != 40 &&
+                    op->src[0]->ne[0] != 48 &&
+                    op->src[0]->ne[0] != 64 &&
+                    op->src[0]->ne[0] != 72 &&
+                    op->src[0]->ne[0] != 80 &&
+                    op->src[0]->ne[0] != 96 &&
+                    op->src[0]->ne[0] != 112 &&
+                    op->src[0]->ne[0] != 128 &&
+                    op->src[0]->ne[0] != 192 &&
+                    op->src[0]->ne[0] != 256 &&
+                    op->src[0]->ne[0] != 576) {
+                    return false;
+                }
+
+                // Q must be F32 (current Metal implementation accumulates in F32)
+                if (op->src[0]->type != GGML_TYPE_F32) {
+                    return false;
+                }
+
+                // K and V must share type
+                if (op->src[1]->type != op->src[2]->type) {
+                    return false;
+                }
+
+                const enum ggml_type tkv = op->src[1]->type;
+                // Force the F16/quantized paths on x86_64 (BF16 is disabled above).
+                if (!(tkv == GGML_TYPE_F16 || ggml_is_quantized(tkv))) {
+                    return false;
+                }
+
+                // mask must be F16 when present (matches ggml-metal-ops.cpp)
+                if (op->src[3] != NULL && op->src[3]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+
+                return true;
             }
-            if (op->src[1]->type != op->src[2]->type) {
-                return false;
-            }
-            return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
@@ -1750,12 +1789,17 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 
     @autoreleasepool {
-        // src: COPY the bytes so caller memory lifetime doesn't matter
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytes:data
-                                                                  length:size
-                                                                 options:MTLResourceStorageModeShared];
+        // On AMD macOS drivers, async uploads + newBufferWithBytes can lead to incoherent weights.
+        // Use staging newBufferWithLength + memcpy, and (optionally) fence on completion.
+        const bool need_sync =
+        ggml_metal_device_is_amd(buf->dev) ||
+        (getenv("GGML_METAL_SYNC_UPLOAD") != NULL);
+        
+        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithLength:size
+                                                                         options:MTLResourceStorageModeShared];
         GGML_ASSERT(buf_src);
-
+        memcpy([buf_src contents], data, size);
+        
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
         bid_dst.offs += offset;
@@ -1768,9 +1812,30 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
                        size:size];
         [enc endEncoding];
 
+        dispatch_semaphore_t sem = NULL;
+        if (need_sync) {
+            sem = dispatch_semaphore_create(0);
+            GGML_ASSERT(sem);
+        }
+        
+        // Keep buf_src alive until GPU finished consuming it, then release.
+        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            if (cb.error) {
+                GGML_ABORT("ggml_metal_buffer_set_tensor: blit failed: %s",
+                           cb.error.localizedDescription.UTF8String);
+            }
+            [buf_src release];
+            if (sem) {
+                dispatch_semaphore_signal(sem);
+            }
+        }];
+        
         [cmd_buf commit];
-        // NO WAIT: the compute command buffers enqueued/committed after this on the same queue
-        // will naturally execute after the blit.
+        
+        if (sem) {
+            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+            dispatch_release(sem);
+        }
     }
 }
 

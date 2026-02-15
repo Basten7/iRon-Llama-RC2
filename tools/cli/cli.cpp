@@ -5,12 +5,12 @@
 
 #include "server-context.h"
 #include "server-task.h"
-
+#include <cstring>
 #include <atomic>
 #include <fstream>
 #include <thread>
 #include <signal.h>
-
+#include <vector>
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -191,10 +191,32 @@ int main(int argc, char ** argv) {
 
     params.verbosity = LOG_LEVEL_ERROR; // by default, less verbose logs
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
+//    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
+    // Local override: allow `--flash-attn` for this CLI even if common/arg doesn't define it.
+    // We filter the args so common_params_parse() won't reject unknown flags.
+    std::vector<char *> argv_filtered;
+    argv_filtered.reserve(argc);
+    argv_filtered.push_back(argv[0]);
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--flash-attn") == 0) {
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--no-flash-attn") == 0) {
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            continue;
+        }
+        argv_filtered.push_back(argv[i]);
+    }
+    
+    int   argc2 = (int) argv_filtered.size();
+    char **argv2 = argv_filtered.data();
+    
+    if (!common_params_parse(argc2, argv2, params, LLAMA_EXAMPLE_CLI)) {
+
         return 1;
     }
-
+//toto
     // TODO: maybe support it later?
     if (params.conversation_mode == COMMON_CONVERSATION_MODE_DISABLED) {
         console::error("--no-conversation is not supported by llama-cli\n");

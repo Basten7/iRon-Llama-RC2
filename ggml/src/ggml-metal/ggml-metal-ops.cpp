@@ -148,11 +148,8 @@ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
     if (!ctx->mem_ranges) {
         return true;
     }
-
     ggml_metal_encoder_memory_barrier(ctx->enc);
-
     ggml_mem_ranges_reset(ctx->mem_ranges);
-
     return true;
 }
 
@@ -2218,8 +2215,15 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     const int64_t ne00 = op->src[0]->ne[0]; // head size
     const int64_t ne01 = op->src[0]->ne[1]; // batch size
 
+#if defined(__APPLE__) && defined(__x86_64__)
+    // On Intel macOS + AMD GPUs, prefer the vectorized FlashAttention kernel.
+    // The non-vec specializations can fail to compile on some driver/toolchain combos.
+    (void) ne01;
+    return (ne00 % 32 == 0);
+#else
     // use vec kernel if the batch size is small and if the head size is supported
     return (ne01 < 20) && (ne00 % 32 == 0);
+#endif
 }
 
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
@@ -2288,8 +2292,9 @@ size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
         return res;
     }
 
-    const bool is_vec = ggml_metal_op_flash_attn_ext_use_vec(op);
-
+    // TOTO: is_vec already referenced above in other builds; keep the call here to avoid
+    // warnings when the local is removed.
+    (void) ggml_metal_op_flash_attn_ext_use_vec(op);
     // Always reserve the non-vec blk buffer size.
     // Rationale:
     // - vector kernels do not use this optimization in practice
@@ -2409,9 +2414,12 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_tmp = bid_blk;
     bid_tmp.offs += ggml_metal_op_flash_attn_ext_extra_blk(op);
 
-    const bool use_vec =
-    ggml_metal_op_flash_attn_ext_use_vec(op) &&
-    !ggml_metal_device_is_amd(ctx->dev);
+    // NOTE (AMD/Metal3): the half8x8 flash_attn_ext kernel variant
+    // (kernel_flash_attn_ext_f16_dk128_dv128_..._bcm=1_...) fails to compile on AMD drivers
+    // ("SC compilation failure: There is a call to an undefined label").
+    // Force the vec path on AMD to avoid runtime pipeline compilation failures and crashes.
+    bool use_vec = ggml_metal_device_is_amd(ctx->dev) || ggml_metal_op_flash_attn_ext_use_vec(op);
+         
     
     if (!use_vec) {
         // half8x8 kernel
@@ -2448,7 +2456,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             };
 
             auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, has_mask, ncpsg);
-
+            if (!pipeline0.pipeline) {
+                GGML_LOG_WARN("%s: flash_attn_ext_pad pipeline not available; falling back to vec kernel\\n", __func__);
+                use_vec = true;
+                goto flash_attn_ext_vec;
+            }
             ggml_metal_encoder_set_pipeline(enc, pipeline0);
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src1, 1);
@@ -2479,7 +2491,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             };
 
             auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_blk(lib, op, nqptg, ncpsg);
-
+            if (!pipeline0.pipeline) {
+                GGML_LOG_WARN("%s: flash_attn_ext_blk pipeline not available; falling back to vec kernel\\n", __func__);
+                use_vec = true;
+                goto flash_attn_ext_vec;
+            }
             ggml_metal_encoder_set_pipeline(enc, pipeline0);
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
@@ -2601,8 +2617,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
 #undef FATTN_SMEM
-    } else {
-        // half4x4 kernel
+            return 1;
+        }
+        
+        flash_attn_ext_vec:
+            {        // half4x4 kernel
         const int nqptg = OP_FLASH_ATTN_EXT_VEC_NQPTG; // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache values per simdgroup !! sync with kernel template arguments !!
         const int nkpsg = 1*ncpsg;
@@ -2637,7 +2656,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             };
 
             auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, has_mask, ncpsg);
-
+            if (!pipeline0.pipeline) {
+                GGML_ABORT("%s: flash_attn_ext_pad pipeline not available (vec path)", __func__);
+            }
             ggml_metal_encoder_set_pipeline(enc, pipeline0);
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src1, 1);
@@ -2739,7 +2760,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         };
 
         auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg);
-
+        if (!pipeline.pipeline) {
+            GGML_ABORT("%s: failed to get flash_attn_ext_vec pipeline (base Metal shader did not compile)", __func__);
+        }
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -2791,7 +2814,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 };
 
                 auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
-
+                if (!pipeline0.pipeline) {
+                    GGML_ABORT("%s: failed to get flash_attn_ext_vec_reduce pipeline", __func__);
+                }
                 ggml_metal_encoder_set_pipeline(enc, pipeline0);
                 ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);

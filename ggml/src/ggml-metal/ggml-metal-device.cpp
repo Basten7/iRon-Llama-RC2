@@ -1,16 +1,15 @@
-//ggml-metal-device.fixed.cpp le 8/02/2026 à 14-45
-
 #include "ggml-metal-device.h"
 
 #include "ggml-metal-impl.h"
 
 #include "ggml-impl.h"
+#include "ggml.h"
 
 #include <cassert>
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <cstdlib>
+
 
 struct ggml_metal_device_deleter {
     void operator()(ggml_metal_device_t ctx) {
