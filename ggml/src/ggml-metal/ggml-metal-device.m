@@ -5,7 +5,7 @@
 #include <Foundation/Foundation.h>
 
 #include <Metal/Metal.h>
-
+#include <pthread.h>
 #include <stdatomic.h>
 
 #ifndef TARGET_OS_VISION
@@ -1893,49 +1893,68 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         [buf_dst release];
     }
 }
+
+// Upload synchronization policy:
+// - On AMD macOS drivers we occasionally see incoherent weights with fully async uploads.
+//   To keep coherence while avoiding a wait per tensor, we wait once every N MiB uploaded.
+// - GGML_METAL_SYNC_UPLOAD=1 forces strict mode: wait per upload (debug / safest).
+// - GGML_METAL_UPLOAD_CHUNK_MB overrides the chunk size in MiB (default 128).
+static pthread_mutex_t s_upload_sync_lock = PTHREAD_MUTEX_INITIALIZER;
+static int            s_upload_sync_inited = 0;
+static size_t         s_upload_chunk_bytes = 128ull * 1024ull * 1024ull;
+static size_t         s_upload_inflight_bytes = 0;
+static bool           s_upload_strict = false;
+
+static void ggml_metal_upload_sync_init_once(void) {
+    if (s_upload_sync_inited) {
+        return;
+    }
+    s_upload_strict = (getenv("GGML_METAL_SYNC_UPLOAD") != NULL);
+    const char * env_mb = getenv("GGML_METAL_UPLOAD_CHUNK_MB");
+    if (env_mb && env_mb[0]) {
+        long mb = strtol(env_mb, NULL, 10);
+        if (mb > 0) {
+            s_upload_chunk_bytes = (size_t) mb * 1024ull * 1024ull;
+        }
+    }
+    s_upload_sync_inited = 1;
+}
+
+
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor,
-                                 const void * data, size_t offset, size_t size) {
+                                  const void * data, size_t offset, size_t size) {
     if (buf->is_shared) {
         memcpy((char *) tensor->data + offset, data, size);
         return;
     }
 
     @autoreleasepool {
-        // --- Sync policy (AMD correctness without per-tensor wait) ---
-        // GGML_METAL_SYNC_UPLOAD=1        -> wait for every tensor upload (legacy/debug)
-        // GGML_METAL_UPLOAD_CHUNK_MB=<N>  -> on AMD, wait every N MiB (default 128)
-        // chunk=0                         -> no periodic waits (not recommended on AMD if you saw incoherence)
+        // Decide if we should wait for this upload
+        bool strict = false;
+        size_t chunk_bytes = 0;
 
-        static ggml_metal_device_t s_dev = NULL;
-        static bool   s_is_amd = false;
-        static size_t s_accum_bytes = 0;
-        static size_t s_chunk_bytes = 0;
+        pthread_mutex_lock(&s_upload_sync_lock);
+        ggml_metal_upload_sync_init_once();
+        strict = s_upload_strict;
+        chunk_bytes = s_upload_chunk_bytes;
+        pthread_mutex_unlock(&s_upload_sync_lock);
 
-        const bool force_sync = (getenv("GGML_METAL_SYNC_UPLOAD") != NULL);
+        const bool is_amd = ggml_metal_device_is_amd(buf->dev);
 
-        // Recompute per-device (in case multiple GPUs / device switches)
-        if (s_dev != buf->dev) {
-            s_dev = buf->dev;
-            s_is_amd = ggml_metal_device_is_amd(buf->dev);
-            s_accum_bytes = 0;
-
-            size_t chunk_mb = 0;
-            if (s_is_amd && !force_sync) {
-                const char * env_chunk_mb = getenv("GGML_METAL_UPLOAD_CHUNK_MB");
-                chunk_mb = 128; // default AMD
-                if (env_chunk_mb && env_chunk_mb[0]) {
-                    chunk_mb = (size_t) strtoull(env_chunk_mb, NULL, 10);
-                }
+        bool do_wait = false;
+        if (strict) {
+            do_wait = true;
+        } else if (is_amd && chunk_bytes > 0) {
+            pthread_mutex_lock(&s_upload_sync_lock);
+            s_upload_inflight_bytes += size;
+            if (s_upload_inflight_bytes >= chunk_bytes) {
+                s_upload_inflight_bytes = 0;
+                do_wait = true;
             }
-            s_chunk_bytes = chunk_mb * (size_t) 1024 * (size_t) 1024;
+            pthread_mutex_unlock(&s_upload_sync_lock);
         }
 
-        const bool chunked_sync = (s_is_amd && !force_sync && s_chunk_bytes > 0);
-        const bool do_wait =
-            force_sync ||
-            (chunked_sync && (s_accum_bytes + size >= s_chunk_bytes));
-
-        // --- Staging src buffer (robust on AMD) ---
+        // staging src
         id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithLength:size
                                                                   options:MTLResourceStorageModeShared];
         GGML_ASSERT(buf_src);
@@ -1953,35 +1972,23 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
                        size:size];
         [enc endEncoding];
 
-        dispatch_semaphore_t sem = NULL;
-        if (do_wait) {
-            sem = dispatch_semaphore_create(0);
-            GGML_ASSERT(sem);
-        }
-
-        // Keep buf_src alive until the GPU finished consuming it.
+        // Keep staging buffer alive until GPU has consumed it
         [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             if (cb.error) {
                 GGML_ABORT("ggml_metal_buffer_set_tensor: blit failed: %s",
                            cb.error.localizedDescription.UTF8String);
             }
             [buf_src release];
-            if (sem) {
-                dispatch_semaphore_signal(sem);
-            }
         }];
 
         [cmd_buf commit];
 
-        if (sem) {
-            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-            dispatch_release(sem);
-            s_accum_bytes = 0;
-        } else if (chunked_sync) {
-            s_accum_bytes += size;
+        if (do_wait) {
+            [cmd_buf waitUntilCompleted];
         }
     }
 }
+
 
 
 void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
