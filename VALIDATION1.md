@@ -30,3 +30,43 @@ tools/cli/cli.cpp : probablement options/params (FA auto, etc.)
 
 git tag -a iron-7926-amd-fa-stable -m "AMD W6800X: stable upload + FA fallback + coherence OK"
 git show --name-only --oneline --decorate iron-7926-amd-fa-stable
+
+
+
+Mesurer maintenant le gain réel de la taille des chunk
+
+le temps de chargement avec/ sans chunking :
+
+strict (attente par upload)
+
+export GGML_METAL_SYNC_UPLOAD=1
+time ./build/bin/llama-cli -ngl 99 --no-mmap -m ~/Models/Qwen3-Coder-30B-A3B-Q4_K_M.gguf -p "hi" -n 1
+
+
+chunk 128 MiB (défaut)
+
+unset GGML_METAL_SYNC_UPLOAD
+unset GGML_METAL_UPLOAD_CHUNK_MB
+time ./build/bin/llama-cli -ngl 99 --no-mmap -m ~/Models/Qwen3-Coder-30B-A3B-Q4_K_M.gguf -p "hi" -n 1
+
+
+chunk 256 MiB
+
+export GGML_METAL_UPLOAD_CHUNK_MB=256
+time ./build/bin/llama-cli -ngl 99 --no-mmap -m ~/Models/Qwen3-Coder-30B-A3B-Q4_K_M.gguf -p "hi" -n 1
+
+Petit raffinement (recommandé)
+
+Ton code permet UPLOAD_CHUNK_MB=0 → no periodic waits. Je te déconseille sur AMD si tu as déjà vu de l’incohérence. Par contre tu peux tester une fois :
+
+unset GGML_METAL_SYNC_UPLOAD
+export GGML_METAL_UPLOAD_CHUNK_MB=0
+time ./build/bin/llama-cli -ngl 99 --no-mmap -m ~/Models/Qwen3-Coder-30B-A3B-Q4_K_M.gguf -p "hi" -n 1
+
+Gain
+
+Strict → 128 MiB : 28.346 − 24.044 = 4.302 s gagnées (~15.2%)
+
+Strict → 256 MiB : 28.346 − 23.416 = 4.930 s gagnées (~17.4%)
+
+128 → 256 MiB : 24.044 − 23.416 = 0.628 s (~2.6%)
