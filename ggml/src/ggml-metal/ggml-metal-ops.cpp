@@ -2288,7 +2288,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
         return res;
     }
 
-    const bool is_vec = ggml_metal_op_flash_attn_ext_use_vec(op);
+    (void) ggml_metal_op_flash_attn_ext_use_vec(op);
 
     // Always reserve the non-vec blk buffer size.
     // Rationale:

@@ -8,9 +8,9 @@
 #import "ggml-metal-ops.h"
 
 #import <Foundation/Foundation.h>
-
+#include <pthread.h>
 #import <Metal/Metal.h>
-
+#include <stdlib.h>
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -373,25 +373,34 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = 64;
 
-    // number of threads in addition to the main thread
-    //const int n_cb = ctx->n_cb;
-    int n_cb = ctx->n_cb;
+    // number of worker command buffers (in addition to the main-thread buffer)
+    // note: the main-thread buffer is stored at index ctx->n_cb (see original scheme below)
+    const int cb_main = ctx->n_cb;
+    int n_cb_workers  = ctx->n_cb;
     
-    // Force "1 CommandBuffer per decode" (and therefore 1 encoder) when requested.
-    // We keep it opt-in to avoid impacting prefill/batch cases unless you want it.
+    // Decode scheduling knob (opt-in):
     //
     // Usage:
-    //   export GGML_METAL_DECODE_1CB=1
+    //  export GGML_METAL_DECODE_SCHED=1
+    //  export GGML_METAL_DECODE_NODES_MAX=256   (optional, default 256)
     //
-    // Heuristic: if enabled, apply when gf is small-batch/token-like or when concurrency is disabled.
-    // (decode in llama.cpp typically runs with use_concurrency=false already.)
-    const bool force_decode_1cb = (getenv("GGML_METAL_DECODE_1CB") != NULL);
-    if (force_decode_1cb) {
-        // Forcing n_cb=0 guarantees:
-        // - exactly 1 MTLCommandBuffer
-        // - exactly 1 ggml_metal_op instance => 1 MTLComputeCommandEncoder
-        n_cb = 0;
+    // If enabled, we collapse small/token-like graphs to a single CB/CE by setting
+    // n_cb_workers=0 while keeping cb_main index unchanged.
+    if (getenv("GGML_METAL_DECODE_SCHED") != NULL) {
+        int nodes_max = 256;
+        const char * env = getenv("GGML_METAL_DECODE_NODES_MAX");
+        if (env && env[0]) {
+            const int v = atoi(env);
+            if (v > 0) {
+                nodes_max = v;
+            }
+        }
+    
+        if (gf->n_nodes <= nodes_max) {
+            n_cb_workers = 0;
+        }
     }
+    
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
 
@@ -408,8 +417,14 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         ctx->n_nodes_0 = MIN(n_main, gf->n_nodes);
         ctx->n_nodes_1 = gf->n_nodes - ctx->n_nodes_0;
 
-        ctx->n_nodes_per_cb = (ctx->n_nodes_1 + ctx->n_cb - 1) / ctx->n_cb;
-
+        // number of nodes per worker CB (avoid division by zero when workers are disabled)
+        if (n_cb_workers > 0) {
+            const int n_cb_denom = n_cb_workers > 0 ? n_cb_workers : 1;
+            ctx->n_nodes_per_cb = (ctx->n_nodes_1 + n_cb_denom - 1) / n_cb_denom;        }
+        else {
+        // all remaining nodes will be encoded by cb_main
+        ctx->n_nodes_per_cb = ctx->n_nodes_1;
+        }
         const bool use_capture = ctx->capture_next_compute;
         if (use_capture) {
             ctx->capture_next_compute = false;
@@ -444,27 +459,27 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
         // the main thread commits the first few commands immediately
-        // cmd_buf[n_cb]
+        // cmd_buf[cb_main]
         {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
 
-            if (ctx->cmd_bufs[n_cb].obj) {
-                [ctx->cmd_bufs[n_cb].obj release];
+            if (ctx->cmd_bufs[cb_main].obj) {
+                [ctx->cmd_bufs[cb_main].obj release];
             }
-            ctx->cmd_bufs[n_cb].obj = cmd_buf;
+            ctx->cmd_bufs[cb_main].obj = cmd_buf;
 
             [cmd_buf enqueue];
 
-            ctx->encode_async(n_cb);
+            ctx->encode_async(cb_main);
         }
 
         // remember the command buffer for the next iteration
-        ctx->cmd_buf_last = ctx->cmd_bufs[n_cb].obj;
+        ctx->cmd_buf_last = ctx->cmd_bufs[cb_main].obj;
 
         // prepare the rest of the command buffers asynchronously (optional)
-        // cmd_buf[0.. n_cb)
-        for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+        // cmd_buf[0.. n_cb_workers)
+        for (int cb_idx = 0; cb_idx < n_cb_workers; ++cb_idx) {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
 
@@ -484,7 +499,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
         }
 
-        dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        dispatch_apply(n_cb_workers, ctx->d_queue, ctx->encode_async);
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -495,12 +510,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             // wait for completion and check status of each command buffer
             // needed to detect if the device ran out-of-memory for example (#1881)
             {
-                id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[n_cb].obj;
+                id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_main].obj;
                 [cmd_buf waitUntilCompleted];
 
                 MTLCommandBufferStatus status = [cmd_buf status];
                 if (status != MTLCommandBufferStatusCompleted) {
-                    GGML_LOG_INFO("%s: command buffer %d failed with status %lu\n", __func__, n_cb, status);
+                    GGML_LOG_INFO("%s: command buffer %d failed with status %lu\n", __func__, cb_main, status);
                     if (status == MTLCommandBufferStatusError) {
                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                     }
@@ -509,13 +524,14 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 }
             }
 
-            for (int i = 0; i < n_cb; ++i) {
+            for (int i = 0; i < n_cb_workers; ++i) {
                 id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[i].obj;
                 [cmd_buf waitUntilCompleted];
 
                 MTLCommandBufferStatus status = [cmd_buf status];
                 if (status != MTLCommandBufferStatusCompleted) {
                     GGML_LOG_INFO("%s: command buffer %d failed with status %lu\n", __func__, i, status);
+                    
                     if (status == MTLCommandBufferStatusError) {
                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                     }
@@ -523,7 +539,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     return GGML_STATUS_FAILED;
                 }
 
-                id<MTLCommandBuffer> next_buffer = (i + 1 < n_cb ? ctx->cmd_bufs[i + 1].obj : nil);
+                id<MTLCommandBuffer> next_buffer = (i + 1 < n_cb_workers ? ctx->cmd_bufs[i + 1].obj : nil);
                 if (!next_buffer) {
                     continue;
                 }
