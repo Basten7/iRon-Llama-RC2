@@ -8,6 +8,11 @@
 
 #include <stdatomic.h>
 
+#include <dispatch/dispatch.h>
+
+#ifndef OS_OBJECT_USE_OBJC
+#define OS_OBJECT_USE_OBJC 0
+#endif
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
 #endif
@@ -1750,12 +1755,16 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 
     @autoreleasepool {
-        // src: COPY the bytes so caller memory lifetime doesn't matter
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytes:data
-                                                                  length:size
+        // On AMD macOS drivers, async uploads with newBufferWithBytes can lead to incoherent weights.
+        // Use staging newBufferWithLength + memcpy, then blit. Optionally fence on completion.
+        const bool need_sync =
+            ggml_metal_device_is_amd(buf->dev) ||
+            (getenv("GGML_METAL_SYNC_UPLOAD") != NULL);
+        
+        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithLength:size
                                                                  options:MTLResourceStorageModeShared];
         GGML_ASSERT(buf_src);
-
+        memcpy([buf_src contents], data, size);
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
         bid_dst.offs += offset;
@@ -1767,10 +1776,32 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
                    toBuffer:bid_dst.metal destinationOffset:bid_dst.offs
                        size:size];
         [enc endEncoding];
-
+        dispatch_semaphore_t sem = NULL;
+        if (need_sync) {
+            sem = dispatch_semaphore_create(0);
+            GGML_ASSERT(sem);
+        }
+        
+        // Keep buf_src alive until GPU finished consuming it, then release.
+        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            if (cb.error) {
+                GGML_ABORT("ggml_metal_buffer_set_tensor: blit failed: %s",
+                           cb.error.localizedDescription.UTF8String);
+            }
+            [buf_src release];
+            if (sem) {
+                dispatch_semaphore_signal(sem);
+            }
+        }];
+        
         [cmd_buf commit];
-        // NO WAIT: the compute command buffers enqueued/committed after this on the same queue
-        // will naturally execute after the blit.
+        
+        if (sem) {
+            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        #if !OS_OBJECT_USE_OBJC
+                    dispatch_release(sem);
+        #endif
+                }
     }
 }
 

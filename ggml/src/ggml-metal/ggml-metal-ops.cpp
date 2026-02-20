@@ -3,11 +3,61 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <strings.h>
+
+// Flash-Attention debug/override knobs (env):
+//  - GGML_METAL_FA_VEC = 0|1|auto   (override vec path selection; default: auto)
+//  - GGML_METAL_FA_NSG = <int>      (override nsg for FA kernels; 0 disables override)
+//  - GGML_METAL_FA_LOG = 0|1        (emit targeted FA selection logs)
+static int ggml_metal_env_tri(const char * name, int def_value) {
+    const char * v = std::getenv(name);
+    if (!v || !v[0]) return def_value;
+    if (strcmp(v, "0") == 0 || strcasecmp(v, "off") == 0 || strcasecmp(v, "false") == 0) return 0;
+    if (strcmp(v, "1") == 0 || strcasecmp(v, "on")  == 0 || strcasecmp(v, "true")  == 0) return 1;
+    if (strcasecmp(v, "auto") == 0) return -1;
+    return def_value;
+}
+
+static int ggml_metal_env_int(const char * name, int def_value) {
+    const char * v = std::getenv(name);
+    if (!v || !v[0]) return def_value;
+    char * end = nullptr;
+    long x = std::strtol(v, &end, 10);
+    if (end == v) return def_value;
+    if (x < INT_MIN) x = INT_MIN;
+    if (x > INT_MAX) x = INT_MAX;
+    return (int) x;
+}
+// Parse env flag in {auto,on,off,1,0,true,false} -> returns {-1,1,0}
+// Any other value falls back to atoi(val).
+static int ggml_metal_env_auto01(const char * name, int def_value) {
+    const char * val = getenv(name);
+    if (!val || val[0] == '\0') {
+        return def_value;
+    }
+    if (strcmp(val, "auto") == 0)  return -1;
+    if (strcmp(val, "on") == 0)    return  1;
+    if (strcmp(val, "off") == 0)   return  0;
+    if (strcmp(val, "true") == 0)  return  1;
+    if (strcmp(val, "false") == 0) return  0;
+    if (strcmp(val, "1") == 0)     return  1;
+    if (strcmp(val, "0") == 0)     return  0;
+    return atoi(val);
+}
+
+static bool ggml_metal_fa_log_enabled(void) {
+    static int cached = -2;
+    if (cached == -2) cached = ggml_metal_env_tri("GGML_METAL_FA_LOG", 0);
+    return cached == 1;
+}
 
 #include "ggml-metal-impl.h"
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
-
+#include <atomic>
 #include <cassert>
 #include <algorithm>
 #include <limits>
@@ -2211,16 +2261,72 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
 
     return 1;
 }
-
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
-    const int64_t ne00 = op->src[0]->ne[0]; // head size
+    // Q: [dkq, B, n_head, ...] in ggml terms src0
+    const int64_t ne00 = op->src[0]->ne[0]; // head size (Q)
     const int64_t ne01 = op->src[0]->ne[1]; // batch size
 
-    // use vec kernel if the batch size is small and if the head size is supported
-    return (ne01 < 20) && (ne00 % 32 == 0);
+    // Provide ne11 (KV length) via GGML_TENSOR_LOCALS on src1
+    GGML_TENSOR_LOCALS(int32_t, ne1, op->src[1], ne); // ne11 is int32_t
+
+    // Provide ne20 (head size V) via GGML_TENSOR_LOCALS on src2
+    GGML_TENSOR_LOCALS(int32_t, ne2, op->src[2], ne); // ne20 is int32_t
+
+    // Env override:
+    //   -1 = auto (default)
+    //    0 = force off
+    //    1 = request on (still guarded)
+    int env_vec = ggml_metal_env_int("GGML_METAL_FA_VEC", -1);
+    if (env_vec < -1) env_vec = -1;
+    if (env_vec >  1) env_vec =  1;
+
+    if (env_vec == 0) {
+        if (ggml_metal_fa_log_enabled()) {
+            GGML_LOG_INFO("ggml-metal: FA: vec forced OFF (GGML_METAL_FA_VEC=0)\n");
+        }
+        return false;
+    }
+
+    // Conservative guardrails for vec kernel path (robustness first).
+    const int32_t dkq = (int32_t) ne00;
+    const int32_t dv  = (int32_t) ne20;
+
+    const bool type_ok =
+        (op->src[0]->type == GGML_TYPE_F32) &&
+        (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_BF16) &&
+        (op->src[2]->type == op->src[1]->type);
+
+    const bool small_b    = (ne01 < 20);
+    const bool dims_ok    = (dkq <= 256) && (dv <= 256) && (dkq % 32 == 0) && (dv % 8 == 0);
+    const bool kv_aligned = (ne11 % OP_FLASH_ATTN_EXT_VEC_NCPSG) == 0;
+
+    const bool use_vec = type_ok && small_b && dims_ok && kv_aligned;
+
+    // If user requests vec ON but guardrails reject it, keep it OFF (avoid hangs).
+    if (env_vec == 1 && !use_vec) {
+        if (ggml_metal_fa_log_enabled()) {
+            GGML_LOG_INFO(
+                "ggml-metal: FA: vec requested but rejected by guardrails "
+                "(dkq=%d dv=%d B=%d type_ok=%d kv_aligned=%d ne11=%d ncpsg=%d)\n",
+                (int) dkq, (int) dv, (int) ne01, (int) type_ok, (int) kv_aligned,
+                (int) ne11, (int) OP_FLASH_ATTN_EXT_VEC_NCPSG);
+        }
+        return false;
+    }
+
+    if (ggml_metal_fa_log_enabled()) {
+        GGML_LOG_INFO(
+            "ggml-metal: FA: use_vec=%d (dkq=%d dv=%d B=%d ne11=%d ncpsg=%d types=[%d,%d,%d])\n",
+            (int) use_vec, (int) dkq, (int) dv, (int) ne01, (int) ne11, (int) OP_FLASH_ATTN_EXT_VEC_NCPSG,
+            (int) op->src[0]->type, (int) op->src[1]->type, (int) op->src[2]->type);
+    }
+
+    return use_vec;
 }
+
+
 
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
@@ -2359,7 +2465,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->src[1]->type == op->src[2]->type);
 
-    //GGML_ASSERT(ggml_are_same_shape (src1, src2));
     GGML_ASSERT(ne11 == ne21);
     GGML_ASSERT(ne12 == ne22);
 
@@ -2409,10 +2514,49 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_tmp = bid_blk;
     bid_tmp.offs += ggml_metal_op_flash_attn_ext_extra_blk(op);
 
-    const bool use_vec =
-    ggml_metal_op_flash_attn_ext_use_vec(op) &&
-    !ggml_metal_device_is_amd(ctx->dev);
-    
+    const size_t pad_bytes = (size_t) ggml_metal_op_flash_attn_ext_extra_pad(op);
+    const size_t blk_bytes = (size_t) ggml_metal_op_flash_attn_ext_extra_blk(op);
+    const size_t tmp_bytes = (size_t) ggml_metal_op_flash_attn_ext_extra_tmp(op);
+
+    // Conservative alignment checks to catch mis-sized scratch allocations early.
+    GGML_ASSERT((bid_pad.offs % 16) == 0);
+    GGML_ASSERT((bid_blk.offs % 16) == 0);
+    GGML_ASSERT((bid_tmp.offs % 16) == 0);
+
+    if (ggml_metal_fa_log_enabled()) {
+        GGML_LOG_DEBUG("ggml_metal: fattn_ext scratch: dst=%zu pad=%zu blk=%zu tmp=%zu (bytes: pad=%zu blk=%zu tmp=%zu)\n",
+                       (size_t) bid_dst.offs, (size_t) bid_pad.offs, (size_t) bid_blk.offs, (size_t) bid_tmp.offs,
+                       pad_bytes, blk_bytes, tmp_bytes);
+    }
+
+    const int32_t env_vec = ggml_metal_env_auto01("GGML_METAL_FA_VEC", -1);
+
+    // Default policy:
+    // - tiled path as baseline
+    // - vec path only when heuristic says so, plus extra conservative gating on AMD
+    bool use_vec = ggml_metal_op_flash_attn_ext_use_vec(op);
+
+    if (env_vec == 0) {
+        use_vec = false;
+    } else if (env_vec == 1) {
+        // NOTE: If you want "env forces on no matter what", keep this.
+        // If you want "request on but keep guardrails", remove this block.
+        use_vec = true;
+    } else {
+        // env_vec == -1 (auto)
+        if (ggml_metal_device_is_amd(ctx->dev)) {
+            const bool small_heads = (ne00 <= 256) && (ne20 <= 256);
+            if (!(small_heads && !has_sinks && !has_bias && !has_scap)) {
+                use_vec = false;
+            }
+        }
+    }
+
+    if (ggml_metal_fa_log_enabled()) {
+        GGML_LOG_DEBUG("ggml_metal: fattn_ext select: use_vec=%d env_vec=%d amd=%d\n",
+                       (int) use_vec, (int) env_vec, (int) ggml_metal_device_is_amd(ctx->dev));
+    }
+
     if (!use_vec) {
         // half8x8 kernel
         const int nqptg = OP_FLASH_ATTN_EXT_NQPTG; // queries per threadgroup
@@ -2499,52 +2643,45 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         const int is_q = ggml_is_quantized(op->src[1]->type) ? 1 : 0;
 
-        // 2*(2*ncpsg)
-        // ncpsg soft_max values + ncpsg mask values
-        //
-        // 16*32*(nsg)
-        // the shared memory needed for the simdgroups to load the KV cache
-        // each thread loads (dequantizes) 16 head elements, there are 32 threads in th SG
-        //
 #define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(ne00 + 2*GGML_PAD(ne20, 64) + 2*(2*ncpsg)) + is_q*(16*32*(nsg)))*(sizeof(float)/2), 16))
 
-        //int64_t nsgmax = 4;
-        //
-        //if (is_q) {
-        //    nsgmax = 2;
-        //    while (true) {
-        //        const size_t smem = FATTN_SMEM(nsgmax);
-        //        if (smem > props_dev->max_theadgroup_memory_size) {
-        //            break;
-        //        }
-        //        nsgmax *= 2;
-        //    }
-        //    nsgmax /= 2;
-        //}
-
         // simdgroups per threadgroup (a.k.a. warps)
-        //nsg = ne01 <= nqptg ? MAX(4, MIN(nsgmax, MIN(ne11/ncpsg, (int64_t) pipeline.maxTotalThreadsPerThreadgroup/32))) : 4;
         int32_t nsg = 4;
-        
+
         // AMD tuning:
-        // Prefer nsg = 8 when threadgroup memory allows it and the KV cache is large enough
-        // to keep more simdgroups busy. Keep the previous heuristic for non-AMD.
         if (ggml_metal_device_is_amd(ctx->dev)) {
             const bool kv_large = ne11 >= 8*ncpsg;
-            const size_t smem8 = FATTN_SMEM(8);
-        
-            // Avoid using more than half of the threadgroup memory. Excessive TG memory usage
-            // can cause slowdowns on some devices.
+            const size_t smem8  = FATTN_SMEM(8);
+
+            // Avoid using more than half of the threadgroup memory (per your comment).
             if (kv_large && smem8 <= props_dev->max_theadgroup_memory_size/2) {
                 nsg = 8;
             }
         } else {
             nsg = ne00 >= 512 ? 8 : 4;
         }
-        
+
+        // Optional override (robustness/diagnostics)
+        const int32_t env_nsg = ggml_metal_env_int("GGML_METAL_FA_NSG", 0);
+        if (env_nsg > 0) {
+            const int32_t v = env_nsg;
+            const bool is_pow2 = (v & (v - 1)) == 0;
+            if (is_pow2 && v >= 1 && v <= 32) {
+                nsg = v;
+            }
+        }
+
+        if (ggml_metal_fa_log_enabled()) {
+            GGML_LOG_DEBUG("ggml_metal: fattn_ext tiled: ne00=%d ne11=%d ne20=%d has_mask=%d has_sinks=%d has_bias=%d has_scap=%d is_q=%d nsg=%d\n",
+                           (int) ne00, (int) ne11, (int) ne20,
+                           (int) has_mask, (int) has_sinks, (int) has_bias, (int) has_scap,
+                           is_q, (int) nsg);
+        }
+
+        // IMPORTANT: compute smem AFTER final nsg selection, keep it in-scope.
         size_t smem = FATTN_SMEM(nsg);
         if (smem > props_dev->max_theadgroup_memory_size) {
-            nsg = 4;
+            nsg  = 4;
             smem = FATTN_SMEM(nsg);
         }
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
@@ -2584,7 +2721,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(
+            lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -2598,13 +2736,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_dst,  8);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-
         ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
+
 #undef FATTN_SMEM
     } else {
         // half4x4 kernel
         const int nqptg = OP_FLASH_ATTN_EXT_VEC_NQPTG; // queries per threadgroup
-        const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache values per simdgroup !! sync with kernel template arguments !!
+        const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache values per simdgroup
         const int nkpsg = 1*ncpsg;
 
         GGML_ASSERT(nqptg <= 32);
@@ -2657,19 +2795,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_op_concurrency_reset(ctx);
         }
 
-        // ne00 + 2*ncpsg*(nsg)
-        // for each query, we load it as f16 in shared memory (ne00)
-        // and store the soft_max values and the mask
-        //
-        // ne20*(nsg)
-        // each simdgroup has a full f32 head vector in shared mem to accumulate results
-        //
 #define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(GGML_PAD(ne00, 128) + 4*ncpsg*(nsg)) + 2*GGML_PAD(ne20, 128)*(nsg))*(sizeof(float)/2), 16))
 
         int64_t nsgmax = 2;
         while (true) {
             const size_t smem = FATTN_SMEM(nsgmax);
-            // avoid using more than half of the threadgroup memory - can cause slow downs especially for large head sizes
             if (smem > props_dev->max_theadgroup_memory_size/2) {
                 break;
             }
@@ -2677,8 +2807,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
         nsgmax /= 2;
 
-        // simdgroups per threadgroup (a.k.a. warps)
-        //const int64_t nsgt = MAX(2, MIN(nsgmax, MIN((ne11 + nkpsg - 1)/(nkpsg), (int64_t) pipeline.maxTotalThreadsPerThreadgroup/32)));
         const int64_t nsgt = MAX(2, MIN(nsgmax, MIN((ne11 + nkpsg - 1)/(nkpsg), (int64_t) 1024/32)));
 
         int64_t nsg = 1;
@@ -2687,12 +2815,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
         nsg /= 2;
 
-        // workgroups
-        // each workgroup handles nsg*nkpsg cache values
         int32_t nwg = 1;
         if (false) {
-            // for small KV caches, we could launch a single workgroup and write the results directly to dst/
-            // however, this does not lead to significant improvement, so disabled
             nwg = 1;
             nsg = 4;
         } else {
@@ -2701,6 +2825,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             while (2*nwg*nsg*nkpsg < ne11 && nsg < 4) {
                 nsg *= 2;
             }
+        }
+
+        if (ggml_metal_fa_log_enabled()) {
+            GGML_LOG_DEBUG("ggml_metal: fattn_ext vec: ne00=%d ne11=%d ne20=%d has_mask=%d has_sinks=%d has_bias=%d has_scap=%d has_kvpad=%d nsg=%d nwg=%d\n",
+                           (int) ne00, (int) ne11, (int) ne20,
+                           (int) has_mask, (int) has_sinks, (int) has_bias, (int) has_scap,
+                           (int) has_kvpad, (int) nsg, (int) nwg);
         }
 
         ggml_metal_kargs_flash_attn_ext_vec args = {
@@ -2738,7 +2869,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(
+            lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, (int32_t) nsg, nwg);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -2751,38 +2883,30 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
 
         const size_t smem = FATTN_SMEM(nsg);
-
-        //printf("smem: %zu, max: %zu, nsg = %d, nsgmax = %d\n", smem, props_dev->max_theadgroup_memory_size, (int) nsg, (int) nsgmax);
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
         if (nwg == 1) {
             assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) == 0);
 
-            // using 1 workgroup -> write the result directly into dst
             ggml_metal_encoder_set_buffer(enc, bid_pad, 6);
             ggml_metal_encoder_set_buffer(enc, bid_dst, 7);
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03*nwg, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03*nwg, 32, (int32_t) nsg, 1);
         } else {
-            // sanity checks
             assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
 
             GGML_ASSERT(ne01*ne02*ne03 == ne1*ne2*ne3);
             GGML_ASSERT((uint64_t)ne1*ne2*ne3 <= (1u << 31));
 
-            // write the results from each workgroup into a temp buffer
             ggml_metal_encoder_set_buffer(enc, bid_pad, 6);
             ggml_metal_encoder_set_buffer(enc, bid_tmp, 7);
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03*nwg, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03*nwg, 32, (int32_t) nsg, 1);
 
-            // sync the 2 kernels
             ggml_metal_op_concurrency_reset(ctx);
 
-            // reduce the results from the workgroups
             {
                 const int32_t nrows = ne1*ne2*ne3;
 
@@ -2796,11 +2920,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
                 ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
-
                 ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
             }
-        }
-#undef FATTN_SMEM
+             }
     }
 
     return 1;

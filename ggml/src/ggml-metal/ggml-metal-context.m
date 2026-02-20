@@ -11,6 +11,7 @@
 #include <pthread.h>
 #import <Metal/Metal.h>
 #include <stdlib.h>
+#include <inttypes.h>
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -38,7 +39,12 @@ struct ggml_metal {
 
     int debug_graph;
     int debug_fusion;
-
+    // decode scheduling instrumentation (opt-in via GGML_METAL_DECODE_STATS=1)
+    bool     decode_stats_enable;
+    bool     decode_stats_this_graph;
+    uint64_t decode_stats_calls;
+    uint64_t decode_stats_commits;
+    uint64_t decode_stats_nodes_total;
     // how many times a given op was fused
     uint64_t fuse_cnt[GGML_OP_COUNT];
 
@@ -140,6 +146,11 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
         res->debug_graph = val ? atoi(val) : 0;
+        res->decode_stats_enable = getenv("GGML_METAL_DECODE_STATS") != NULL;
+        res->decode_stats_this_graph = false;
+        res->decode_stats_calls = 0;
+        res->decode_stats_commits = 0;
+        res->decode_stats_nodes_total = 0;
     }
 
     {
@@ -225,7 +236,10 @@ void ggml_metal_free(ggml_metal_t ctx) {
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
-        [ctx->cmd_buf_last waitUntilCompleted];
+        const MTLCommandBufferStatus status = [ctx->cmd_buf_last status];
+        if (status != MTLCommandBufferStatusNotEnqueued && status != MTLCommandBufferStatusCompleted) {
+            [ctx->cmd_buf_last waitUntilCompleted];
+        }
         ctx->cmd_buf_last = nil;
     }
 
@@ -240,8 +254,14 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             }
 
             MTLCommandBufferStatus status = [cmd_buf status];
+            if (status == MTLCommandBufferStatusNotEnqueued) {
+                continue;
+            }
             if (status != MTLCommandBufferStatusCompleted) {
-                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
+                [cmd_buf waitUntilCompleted];
+                status = [cmd_buf status];
+            }
+            if (status != MTLCommandBufferStatusCompleted) {                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
                 if (status == MTLCommandBufferStatusError) {
                     GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                 }
@@ -256,8 +276,15 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
 
             MTLCommandBufferStatus status = [cmd_buf status];
+            if (status == MTLCommandBufferStatusNotEnqueued) {
+                [cmd_buf release];
+                continue;
+            }
             if (status != MTLCommandBufferStatusCompleted) {
-                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
+                [cmd_buf waitUntilCompleted];
+                status = [cmd_buf status];
+            }
+            if (status != MTLCommandBufferStatusCompleted) {                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
                 if (status == MTLCommandBufferStatusError) {
                     GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                 }
@@ -386,6 +413,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     //
     // If enabled, we collapse small/token-like graphs to a single CB/CE by setting
     // n_cb_workers=0 while keeping cb_main index unchanged.
+    ctx->decode_stats_this_graph = false;
+    
     if (getenv("GGML_METAL_DECODE_SCHED") != NULL) {
         int nodes_max = 256;
         const char * env = getenv("GGML_METAL_DECODE_NODES_MAX");
@@ -395,9 +424,25 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 nodes_max = v;
             }
         }
-    
-        if (gf->n_nodes <= nodes_max) {
-            n_cb_workers = 0;
+        // decode workers limit: acts as a cap when combined with MIN logic
+        int decode_workers = 0;
+        env = getenv("GGML_METAL_DECODE_CB_WORKERS");
+        if (env && env[0]) {
+            const int v = atoi(env);
+            if (v >= 0) {
+                decode_workers = v;
+            }
+            
+            if (gf->n_nodes <= nodes_max) {
+                // Keep cb_main index unchanged; only adjust worker count.
+                n_cb_workers = MIN(n_cb_workers, decode_workers);
+                ctx->decode_stats_this_graph = true;
+            }
+        }
+        // decode stats: accumulate per-graph counters only when the decode heuristic triggers
+        if (ctx->decode_stats_enable && ctx->decode_stats_this_graph) {
+             ctx->decode_stats_calls++;
+             ctx->decode_stats_nodes_total += (uint64_t) gf->n_nodes;
         }
     }
     
@@ -419,11 +464,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         // number of nodes per worker CB (avoid division by zero when workers are disabled)
         if (n_cb_workers > 0) {
-            const int n_cb_denom = n_cb_workers > 0 ? n_cb_workers : 1;
-            ctx->n_nodes_per_cb = (ctx->n_nodes_1 + n_cb_denom - 1) / n_cb_denom;        }
-        else {
-        // all remaining nodes will be encoded by cb_main
-        ctx->n_nodes_per_cb = ctx->n_nodes_1;
+            const int n_cb_denom = n_cb_workers;
+            ctx->n_nodes_per_cb = (ctx->n_nodes_1 + n_cb_denom - 1) / n_cb_denom;
+        } else {
+            // all remaining nodes will be encoded by cb_main
+            ctx->n_nodes_per_cb = ctx->n_nodes_1;
         }
         const bool use_capture = ctx->capture_next_compute;
         if (use_capture) {
@@ -556,7 +601,17 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
                 [next_buffer commit];
             }
-
+            
+            // decode stats: count commits originating from graph_compute path
+            if (ctx->decode_stats_enable && ctx->decode_stats_this_graph) {
+                ctx->decode_stats_commits++;
+                if ((ctx->decode_stats_calls % 200) == 0) {
+                    const double avg_nodes = (double) ctx->decode_stats_nodes_total / (double) (ctx->decode_stats_calls ? ctx->decode_stats_calls : 1);
+                    const double commits_per_call = (double) ctx->decode_stats_commits / (double) (ctx->decode_stats_calls ? ctx->decode_stats_calls : 1);
+                    GGML_LOG_INFO("metal decode stats: calls=%" PRIu64 " avg_nodes=%.1f commits/call=%.2f\n",
+                                  ctx->decode_stats_calls, avg_nodes, commits_per_call);
+                }
+            }
             [ctx->capture_scope endScope];
             [[MTLCaptureManager sharedCaptureManager] stopCapture];
         }
@@ -632,6 +687,18 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];
+            
+            // decode stats: count commits originating from encode_async workers
+            if (ctx->decode_stats_enable && ctx->decode_stats_this_graph) {
+                ctx->decode_stats_commits++;
+                // log periodically from cb0 to avoid spamming
+                if (cb_idx == 0 && (ctx->decode_stats_calls % 200) == 0) {
+                    const double avg_nodes = (double) ctx->decode_stats_nodes_total / (double) (ctx->decode_stats_calls ? ctx->decode_stats_calls : 1);
+                    const double commits_per_call = (double) ctx->decode_stats_commits / (double) (ctx->decode_stats_calls ? ctx->decode_stats_calls : 1);
+                    GGML_LOG_INFO("metal decode stats: calls=%" PRIu64 " avg_nodes=%.1f commits/call=%.2f\n",
+                                  ctx->decode_stats_calls, avg_nodes, commits_per_call);
+                }
+            }
         }
     });
 }

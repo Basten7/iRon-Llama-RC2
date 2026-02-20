@@ -12,6 +12,38 @@
 #include <unordered_map>
 #include <cstdlib>
 
+
+
+// -----------------------------------------------------------------------------
+// Decode-only env helpers (must be visible before ggml_metal_library_get_pipeline_mul_mv)
+// Prefer env_decode if set, else fall back to env_global.
+static inline const char * ggml_metal_getenv_pref_(const char * env_decode, const char * env_global) {
+    const char * v = getenv(env_decode);
+    if (v && v[0]) {
+        return v;
+    }
+    v = getenv(env_global);
+    if (v && v[0]) {
+        return v;
+    }
+    return NULL;
+}
+
+// NR0 is compile-time in Metal kernels: only a discrete set exists.
+// Pick the greatest allowed NR0 <= max_nr0 (and >=2).
+static inline int ggml_metal_nr0_allowed_leq_(int max_nr0) {
+    if (max_nr0 >= 256) return 256;
+    if (max_nr0 >= 128) return 128;
+    if (max_nr0 >=  64) return  64;
+    if (max_nr0 >=  32) return  32;
+    if (max_nr0 >=  16) return  16;
+    if (max_nr0 >=   8) return   8;
+    if (max_nr0 >=   4) return   4;
+    return 2;
+}
+// -----------------------------------------------------------------------------
+
+
 struct ggml_metal_device_deleter {
     void operator()(ggml_metal_device_t ctx) {
         ggml_metal_device_free(ctx);
@@ -591,7 +623,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
-
+    const bool is_decode = (ne11 == 1 && ne12 == 1 && ne13 == 1);
     char base[256];
     char name[256];
 
@@ -703,8 +735,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // Optional override: more simdgroups per threadgroup for Q4_K mat-vec.
                 // Intended for AMD dGPU (W6800X) tuning without impacting other devices by default.
                 // Usage: export GGML_METAL_Q4K_NSG=4
-                if (const char * env = getenv("GGML_METAL_Q4K_NSG")) {
-                    const int v = atoi(env);
+                const char * env_q4k_nsg =
+                    is_decode ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q4K_NSG", "GGML_METAL_Q4K_NSG")
+                        : getenv("GGML_METAL_Q4K_NSG");
+                if (env_q4k_nsg) {
+                    const int v = atoi(env_q4k_nsg);
                     if (v >= 1 && v <= 8) {
                         nsg = v;
                     }
@@ -714,8 +749,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // NOTE: NR0 is compile-time in the Metal kernel. Only values that have a dedicated
                 // kernel entry point are allowed here.
                 // Usage: export GGML_METAL_Q4K_NR0=32
-                if (const char * env = getenv("GGML_METAL_Q4K_NR0")) {
-                    const int v = atoi(env);
+                const char * env_q4k_nr0 =
+                    is_decode ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q4K_NR0", "GGML_METAL_Q4K_NR0")
+                                : getenv("GGML_METAL_Q4K_NR0");
+                if (env_q4k_nr0) {
+                    const int v = atoi(env_q4k_nr0);
                     if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
                         nr0 = v;
                     }
@@ -735,13 +773,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q6_K;
                 nr0 = N_R0_Q6_K;
-
+                // Optional override: simdgroups per threadgroup for Q6_K mat-vec.
+                // Usage: export GGML_METAL_Q6K_NSG=4 (or GGML_METAL_DECODE_Q6K_NSG=4 for decode only)
+                const char * env_q6k_nsg =
+                    is_decode ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q6K_NSG", "GGML_METAL_Q6K_NSG")
+                             : getenv("GGML_METAL_Q6K_NSG");
+                if (env_q6k_nsg) {
+                    const int v = atoi(env_q6k_nsg);
+                    if (v >= 1 && v <= 8) {
+                        nsg = v;
+                    }
+                }
+                
                 // Optional override: rows per threadgroup for Q6_K mat-vec.
                 // NOTE: NR0 is compile-time in the Metal kernel. Only values that have a dedicated
                 // kernel entry point are allowed here.
                 // Usage: export GGML_METAL_Q6K_NR0=128
-                if (const char * env = getenv("GGML_METAL_Q6K_NR0")) {
-                    const int v = atoi(env);
+                const char * env_q6k_nr0 =
+                        is_decode ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q6K_NR0", "GGML_METAL_Q6K_NR0")
+                               : getenv("GGML_METAL_Q6K_NR0");
+                 if (env_q6k_nr0) {
+                   const int v = atoi(env_q6k_nr0);
                     if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
                         nr0 = v;
                     }
@@ -750,6 +802,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                         s_logged_q6k_nr0 = true;
                         GGML_LOG_INFO("%s: Q6_K NR0 override = %d", __func__, (int) nr0);
                     }
+                }
+                
+                // Safety clamp: avoid invalid (ne00 < nsg*nr0) combos.
+                if (nsg < 1) {
+                    nsg = 1;
+                }
+                const int max_nr0 = (int) (ne00 / nsg);
+                if (max_nr0 >= 2) {
+                    const int nr0_clamped = ggml_metal_nr0_allowed_leq_(max_nr0);
+                    if (nr0 > nr0_clamped) {
+                        nr0 = nr0_clamped;
+                    }
+                } else {
+                    nsg = 1;
+                    nr0 = 2;
                 }
             } break;
         case GGML_TYPE_IQ2_XXS:
@@ -812,8 +879,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
     // Q4_K/Q6_K NR0 is compile-time in the Metal kernel. If the user overrides NR0, the host must select
     // a matching kernel entry point (specialized by NR0) to avoid correctness issues.
-    const bool has_q4k_nr0_env = getenv("GGML_METAL_Q4K_NR0") != NULL;
-    const bool has_q6k_nr0_env = getenv("GGML_METAL_Q6K_NR0") != NULL;
+    const bool has_q4k_nr0_env =
+        getenv("GGML_METAL_Q4K_NR0") != NULL || getenv("GGML_METAL_DECODE_Q4K_NR0") != NULL;
+    const bool has_q6k_nr0_env =
+        getenv("GGML_METAL_Q6K_NR0") != NULL || getenv("GGML_METAL_DECODE_Q6K_NR0") != NULL;
 
     if (tsrc0 == GGML_TYPE_Q4_K && has_q4k_nr0_env && nr0 != N_R0_Q4_K) {
         const int v = nr0;
@@ -1432,7 +1501,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
             ns10,
             ns20,
             nsg);
-
+    if (const char * v = getenv("GGML_METAL_FA_LOG")) {
+         if (v[0] && strcmp(v, "0") != 0) {
+             GGML_LOG_INFO("ggml-metal: FA: pipeline %s\n", name);
+         }
+      }
+    
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
@@ -1494,7 +1568,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             ns10,
             ns20,
             nsg, nwg);
-
+       if (const char * v = getenv("GGML_METAL_FA_LOG")) {
+            if (v[0] && strcmp(v, "0") != 0) {
+                GGML_LOG_INFO("ggml-metal: FA: pipeline %s\n", name);
+            }
+        }
+    
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
