@@ -983,7 +983,12 @@ void ggml_metal_device_rsets_rm(ggml_metal_device_t dev, ggml_metal_rset_t rset)
 }
 
 void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev) {
-    if (dev->rsets == NULL) {
+    if (dev == nil) {
+        GGML_LOG_ERROR("ggml-metal: rsets_keep_alive called with dev=NULL\n");
+         return;
+         }
+        
+        if (dev->rsets == NULL) {
         return;
     }
 
@@ -1014,7 +1019,6 @@ bool ggml_metal_device_is_amd(ggml_metal_device_t dev) {
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
-    const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
 
@@ -1165,12 +1169,27 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->ne[0] != 192 &&
                 op->src[0]->ne[0] != 256 &&
                 op->src[0]->ne[0] != 576) {
+                if (getenv("GGML_METAL_FA_LOG") != NULL) {
+                    GGML_LOG_DEBUG("%s: FLASH_ATTN_EXT unsupported head_dim=%d\n", __func__, (int) op->src[0]->ne[0]);
+                }
                 return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
+                if (getenv("GGML_METAL_FA_LOG") != NULL) {
+                   GGML_LOG_DEBUG("%s: FLASH_ATTN_EXT unsupported type mismatch: K=%d V=%d\n", __func__, (int) op->src[1]->type, (int) op->src[2]->type);
+                }
                 return false;
             }
-            return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+            // NOTE: the Metal FA kernels in ggml-metal do not require simdgroup_matrix_mul.
+            // On many AMD dGPU devices, simdgroup matrix mul reports false while the
+            // threadgroup-tiled + simdgroup-reduction implementation works fine.
+            if (!has_simdgroup_reduction) {
+                if (getenv("GGML_METAL_FA_LOG") != NULL) {
+                    GGML_LOG_DEBUG("%s: FLASH_ATTN_EXT requires simdgroup reduction\n", __func__);
+                }
+                return false;
+            }
+            return true;
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;

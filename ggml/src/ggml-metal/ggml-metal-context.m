@@ -81,33 +81,40 @@ struct ggml_metal {
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
-
+    if (dev == nil) {
+          GGML_LOG_ERROR("ggml-metal: ggml_metal_init called with dev=NULL\n");
+         return NULL;
+    }
+    
 #if TARGET_OS_OSX && !GGML_METAL_NDEBUG
     // Show all the Metal device instances in the system
     NSArray * devices = MTLCopyAllDevices();
-    for (id<MTLDevice> device in devices) {
-        GGML_LOG_INFO("%s: found device: %s\n", __func__, [[device name] UTF8String]);
+    for (id<MTLDevice> d in devices) {
+        GGML_LOG_INFO("%s: found device: %s\n", __func__, [[d name] UTF8String]);
     }
-    [devices release]; // since it was created by a *Copy* C method
+    [devices release]; // created by a *Copy* method
 #endif
 
-    // init context
-    ggml_metal_t res = calloc(1, sizeof(struct ggml_metal));
+    ggml_metal_t res = (ggml_metal_t) calloc(1, sizeof(struct ggml_metal));
+    if (!res) {
+        GGML_LOG_ERROR("%s: error: failed to allocate ggml_metal\n", __func__);
+        return NULL;
+    }
+    
+    // Critical: persist the selected device in the context (used by graph_compute and others)
+    res->dev = dev;
 
     id<MTLDevice> device = ggml_metal_device_get_obj(dev);
-
     GGML_LOG_INFO("%s: picking default device: %s\n", __func__, [[device name] UTF8String]);
 
-    // TODO: would it be better to have one queue for the backend and one queue for the device?
-    //       the graph encoders and async ops would use the backend queue while the sync ops would use the device queue?
-    //res->queue = [device newCommandQueue]; [TAG_QUEUE_PER_BACKEND]
+    // Use per-device queue (your design choice)
     id<MTLCommandQueue> queue = ggml_metal_device_get_queue(dev);
     if (queue == nil) {
         GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
+        free(res);
         return NULL;
     }
 
-    res->dev = dev;
     res->lib = ggml_metal_device_get_library(dev);
     if (res->lib == NULL) {
         GGML_LOG_WARN("%s: the device does not have a precompiled Metal library - this is unexpected\n", __func__);
@@ -116,26 +123,22 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->lib = ggml_metal_library_init(dev);
         if (res->lib == NULL) {
             GGML_LOG_ERROR("%s: error: failed to initialize the Metal library\n", __func__);
-
             free(res);
-
             return NULL;
         }
     }
 
-    //const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
-
     res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
-    res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
-    res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
-    
-    // On some discrete GPUs (non-unified memory), concurrency can cause non-deterministic results.
+    res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == NULL;
+    res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == NULL;
+
+    // On discrete GPUs (non-unified), concurrency may cause non-deterministic results.
     // Default to disabling it unless explicitly forced.
     {
         const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
         const bool force_concurrency = getenv("GGML_METAL_CONCURRENCY_FORCE") != NULL;
-    
+
         if (!force_concurrency && props_dev && !props_dev->has_unified_memory) {
             if (res->use_concurrency) {
                 GGML_LOG_WARN("%s: disabling concurrency on discrete (non-unified) GPU; set GGML_METAL_CONCURRENCY_FORCE=1 to override\n", __func__);
@@ -143,48 +146,39 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
             res->use_concurrency = false;
         }
     }
-    {
-        const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
-        res->debug_graph = val ? atoi(val) : 0;
-        res->decode_stats_enable = getenv("GGML_METAL_DECODE_STATS") != NULL;
-        res->decode_stats_this_graph = false;
-        res->decode_stats_calls = 0;
-        res->decode_stats_commits = 0;
-        res->decode_stats_nodes_total = 0;
-    }
 
-    {
-        const char * val = getenv("GGML_METAL_FUSION_DEBUG");
-        res->debug_fusion = val ? atoi(val) : 0;
-    }
+    // Debug flags:
+    // - GGML_METAL_GRAPH_DEBUG / GGML_METAL_FUSION_DEBUG : fine-grained toggles
+    // - GGML_METAL_DEBUG : umbrella switch enabling both
+    const bool debug_all = getenv("GGML_METAL_DEBUG") != NULL;
 
+    const char * val_graph = getenv("GGML_METAL_GRAPH_DEBUG");
+    res->debug_graph  = debug_all ? 1 : (val_graph  ? atoi(val_graph)  : 0);
+
+    const char * val_fusion = getenv("GGML_METAL_FUSION_DEBUG");
+    res->debug_fusion = debug_all ? 1 : (val_fusion ? atoi(val_fusion) : 0);
+
+    res->decode_stats_enable     = getenv("GGML_METAL_DECODE_STATS") != NULL;
+    res->decode_stats_this_graph = false;
+    res->decode_stats_calls      = 0;
+    res->decode_stats_commits    = 0;
+    res->decode_stats_nodes_total = 0;
+
+    // Graph optimizer toggle (default ON)
     res->use_graph_optimize = true;
-
     if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
         res->use_graph_optimize = false;
     }
 
+    // Init counters used by fusion stats, etc.
     memset(res->fuse_cnt, 0, sizeof(res->fuse_cnt));
 
     GGML_LOG_INFO("%s: use fusion         = %s\n", __func__, res->use_fusion         ? "true" : "false");
     GGML_LOG_INFO("%s: use concurrency    = %s\n", __func__, res->use_concurrency    ? "true" : "false");
     GGML_LOG_INFO("%s: use graph optimize = %s\n", __func__, res->use_graph_optimize ? "true" : "false");
-
-    res->capture_next_compute = false;
-    res->capture_started = false;
-    res->capture_scope = nil;
-
-    res->gf = nil;
-    res->encode_async = nil;
-    for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
-        res->cmd_bufs[i].obj = nil;
-    }
-
-    res->cmd_bufs_ext = [[NSMutableArray alloc] init];
-
-    res->cmd_buf_last = nil;
-
-    res->pipelines_ext = ggml_metal_pipelines_init();
+    GGML_LOG_INFO("%s: debug graph        = %d\n", __func__, res->debug_graph);
+    GGML_LOG_INFO("%s: debug fusion       = %d\n", __func__, res->debug_fusion);
+    GGML_LOG_INFO("%s: decode stats       = %s\n", __func__, res->decode_stats_enable ? "true" : "false");
 
     return res;
 }
@@ -435,6 +429,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             
             if (gf->n_nodes <= nodes_max) {
                 // Keep cb_main index unchanged; only adjust worker count.
+                // If GGML_METAL_DECODE_CB_WORKERS is unset, decode_workers defaults to 0
+                // which collapses decode-like graphs to a single CB/CE.
                 n_cb_workers = MIN(n_cb_workers, decode_workers);
                 ctx->decode_stats_this_graph = true;
             }
@@ -445,6 +441,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
              ctx->decode_stats_nodes_total += (uint64_t) gf->n_nodes;
         }
     }
+    if (ctx->dev == nil) {
+         GGML_LOG_ERROR("ggml-metal: ctx->dev is NULL before rsets_keep_alive\n");
+          // ggml_metal_graph_compute is non-void: fail fast instead of segfaulting
+         return GGML_STATUS_FAILED;
+      }
     
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);

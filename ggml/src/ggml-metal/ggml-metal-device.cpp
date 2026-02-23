@@ -53,9 +53,26 @@ struct ggml_metal_device_deleter {
 typedef std::unique_ptr<ggml_metal_device, ggml_metal_device_deleter> ggml_metal_device_ptr;
 
 ggml_metal_device_t ggml_metal_device_get(void) {
-    static ggml_metal_device_ptr ctx { ggml_metal_device_init() };
-
-    return ctx.get();
+    static std::once_flag s_once;
+    static ggml_metal_device_ptr s_dev;
+    
+    std::call_once(s_once, []() {
+        s_dev.reset(ggml_metal_device_init());
+        if (!s_dev) {
+            GGML_LOG_ERROR("ggml-metal: ggml_metal_device_init() returned NULL\n");
+        }
+    });
+    
+    // Defensive: allow a best-effort retry if first init failed (rare, but prevents NULL being sticky forever)
+    if (!s_dev) {
+        ggml_metal_device_t tmp = ggml_metal_device_init();
+        if (tmp) {
+            s_dev.reset(tmp);
+            GGML_LOG_ERROR("ggml-metal: device init succeeded on retry\n");
+        }
+    }
+    
+    return s_dev.get();
 }
 
 struct ggml_metal_pipelines {

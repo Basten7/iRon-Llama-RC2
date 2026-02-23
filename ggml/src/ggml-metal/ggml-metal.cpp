@@ -465,9 +465,19 @@ static ggml_guid_t ggml_backend_metal_guid(void) {
 }
 
 ggml_backend_t ggml_backend_metal_init(void) {
-    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_metal_reg(), 0);
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
-
+    ggml_backend_reg_t reg = ggml_backend_metal_reg();
+    if (reg == NULL) {
+        GGML_LOG_ERROR("%s: error: Metal backend registry unavailable\n", __func__);
+        return NULL;
+    }
+    
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+    if (dev == NULL || dev->context == NULL) {
+        GGML_LOG_ERROR("%s: error: Metal device unavailable\n", __func__);
+        return NULL;
+    }
+    
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t) dev->context;
     ggml_metal_t ctx = ggml_metal_init(ctx_dev);
     if (ctx == NULL) {
         GGML_LOG_ERROR("%s: error: failed to allocate context\n", __func__);
@@ -705,6 +715,12 @@ static ggml_backend_reg_i ggml_backend_metal_reg_i = {
 
 ggml_backend_reg_t ggml_backend_metal_reg(void) {
     {
+        ggml_metal_device_t dev = ggml_metal_device_get();
+        if (dev == NULL) {
+            GGML_LOG_ERROR("ggml-metal: ggml_metal_device_get() returned NULL; Metal backend will not be registered\n");
+            return NULL;
+        }
+        
         g_ggml_metal_reg = {
             /* .api_version = */ GGML_BACKEND_API_VERSION,
             /* .iface       = */ ggml_backend_metal_reg_i,
@@ -714,7 +730,7 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
         g_ggml_metal_device = {
             /* .iface   = */ ggml_backend_metal_device_i,
             /* .reg     = */ &g_ggml_metal_reg,
-            /* .context = */ ggml_metal_device_get(),
+            /* .context = */ dev,
         };
     }
 

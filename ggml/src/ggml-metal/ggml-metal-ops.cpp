@@ -2269,10 +2269,10 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     const int64_t ne01 = op->src[0]->ne[1]; // batch size
 
     // Provide ne11 (KV length) via GGML_TENSOR_LOCALS on src1
-    GGML_TENSOR_LOCALS(int32_t, ne1, op->src[1], ne); // ne11 is int32_t
+    GGML_TENSOR_LOCALS(int32_t, ne1, op->src[1], ne); // ne11
 
     // Provide ne20 (head size V) via GGML_TENSOR_LOCALS on src2
-    GGML_TENSOR_LOCALS(int32_t, ne2, op->src[2], ne); // ne20 is int32_t
+    GGML_TENSOR_LOCALS(int32_t, ne2, op->src[2], ne); // ne20
 
     // Env override:
     //   -1 = auto (default)
@@ -2298,11 +2298,10 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
         (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_BF16) &&
         (op->src[2]->type == op->src[1]->type);
 
-    const bool small_b    = (ne01 < 20);
     const bool dims_ok    = (dkq <= 256) && (dv <= 256) && (dkq % 32 == 0) && (dv % 8 == 0);
     const bool kv_aligned = (ne11 % OP_FLASH_ATTN_EXT_VEC_NCPSG) == 0;
 
-    const bool use_vec = type_ok && small_b && dims_ok && kv_aligned;
+    const bool use_vec = type_ok && dims_ok && kv_aligned;
 
     // If user requests vec ON but guardrails reject it, keep it OFF (avoid hangs).
     if (env_vec == 1 && !use_vec) {
@@ -2348,7 +2347,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
     GGML_ASSERT(OP_FLASH_ATTN_EXT_NCPSG >= OP_FLASH_ATTN_EXT_VEC_NCPSG);
 
     //if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
-    if (false) {
+    if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
         // note: always reserve the padding space to avoid graph reallocations
         //const bool has_kvpad = ne11 % OP_FLASH_ATTN_EXT_VEC_NCPSG != 0;
         const bool has_kvpad = true;
@@ -2426,9 +2425,13 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 
     size_t res = 0;
 
-    // note: always reserve the temp buffer to avoid graph reallocations
-    //if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
-    if (true) {
+    // Reserve the vec tmp buffer when the vec path is selected.
+    // NOTE: this increases memory usage, but it must match runtime kernel selection.
+    int env_vec = ggml_metal_env_int("GGML_METAL_FA_VEC", -1);
+    if (env_vec < -1) env_vec = -1;
+    if (env_vec >  1) env_vec =  1;
+    
+    if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
         const int64_t nwg = 32;
         const int64_t ne01_max = std::min(ne01, 32);
 
