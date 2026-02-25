@@ -103,7 +103,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     
     // Critical: persist the selected device in the context (used by graph_compute and others)
     res->dev = dev;
-
+    
+    GGML_LOG_INFO("%s: ctx=%p dev=%p\n", __func__, (void *) res, (void *) res->dev); //Debug Log TOTO
+    
     id<MTLDevice> device = ggml_metal_device_get_obj(dev);
     GGML_LOG_INFO("%s: picking default device: %s\n", __func__, [[device name] UTF8String]);
 

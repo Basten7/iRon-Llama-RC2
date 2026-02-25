@@ -997,7 +997,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    const bool is_decode = (ne11 == 1);
 
+    // NOTE:
+    // MUL_MAT_ID is on the MoE hot path for Qwen3MoE. We must support the same NR0/NSG overrides
+    // as MUL_MV (non-ID), but selecting kernel_mul_mv_id_* entry points.
+ 
+    // The ID mat-vec kernel is specialized by NR0 at compile-time (Metal template parameter).
+    // Only values with dedicated host_name entry points are allowed.
     char base[256];
     char name[256];
 
@@ -1011,7 +1018,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     const ggml_type tsrc1 = op->src[1]->type;
 
     const char * suffix = "";
-
+    // Decode-aware env overrides (prefer GGML_METAL_DECODE_* when ne11==1)
+    const char * env_q4k_nsg = is_decode
+        ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q4K_NSG", "GGML_METAL_Q4K_NSG")
+        : getenv("GGML_METAL_Q4K_NSG");
+    const char * env_q6k_nsg = is_decode
+        ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q6K_NSG", "GGML_METAL_Q6K_NSG")
+        : getenv("GGML_METAL_Q6K_NSG");
+    
+    const char * env_q4k_nr0 = is_decode
+        ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q4K_NR0", "GGML_METAL_Q4K_NR0")
+        : getenv("GGML_METAL_Q4K_NR0");
+    const char * env_q6k_nr0 = is_decode
+        ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q6K_NR0", "GGML_METAL_Q6K_NR0")
+        : getenv("GGML_METAL_Q6K_NR0");
+    
+    const bool has_q4k_nr0_env = (env_q4k_nr0 != NULL);
+    const bool has_q6k_nr0_env = (env_q6k_nr0 != NULL);
+    
         // use custom matrix x vector kernel
     switch (tsrc0) {
         case GGML_TYPE_F32:
@@ -1095,37 +1119,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nsg = N_SG_Q3_K;
                 nr0 = N_R0_Q3_K;
             } break;
-        case GGML_TYPE_Q4_K:
-            {
-                nsg = N_SG_Q4_K;
-                nr0 = N_R0_Q4_K;
-
-                // Optional override: more simdgroups per threadgroup for Q4_K mat-vec.
-                // Intended for AMD dGPU (W6800X) tuning without impacting other devices by default.
-                // Usage: export GGML_METAL_Q4K_NSG=4
-                if (const char * env = getenv("GGML_METAL_Q4K_NSG")) {
-                    const int v = atoi(env);
-                    if (v >= 1 && v <= 8) {
-                        nsg = v;
-                    }
+        case GGML_TYPE_Q4_K: {
+            nsg = N_SG_Q4_K;
+            nr0 = N_R0_Q4_K;
+            
+            if (env_q4k_nsg) {
+                const int v = atoi(env_q4k_nsg);
+                if (v >= 1 && v <= 8) {
+                    nsg = v;
                 }
-
-                // Optional override: rows per threadgroup for Q4_K mat-vec.
-                // NOTE: NR0 is compile-time in the Metal kernel. Only values that have a dedicated
-                // kernel entry point are allowed here.
-                // Usage: export GGML_METAL_Q4K_NR0=32
-                if (const char * env = getenv("GGML_METAL_Q4K_NR0")) {
-                    const int v = atoi(env);
-                    if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
-                        nr0 = v;
-                    }
-                    static bool s_logged_q4k_nr0 = false;
-                    if (!s_logged_q4k_nr0) {
-                        s_logged_q4k_nr0 = true;
-                        GGML_LOG_INFO("%s: Q4_K NR0 override = %d", __func__, (int) nr0);
-                    }
+            }
+            
+            if (env_q4k_nr0) {
+                const int v = atoi(env_q4k_nr0);
+                if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+                    nr0 = v;
                 }
+            }
             } break;
+
         case GGML_TYPE_Q5_K:
             {
                 nsg = N_SG_Q5_K;
@@ -1135,24 +1147,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_Q6_K;
                 nr0 = N_R0_Q6_K;
+                if (env_q6k_nsg) {
+                    const int v = atoi(env_q6k_nsg);
+                    if (v >= 1 && v <= 8) {
+                        nsg = v;
+                    }
+                }
 
-                // Optional override: rows per threadgroup for Q6_K mat-vec.
-                // NOTE: NR0 is compile-time in the Metal kernel. Only values that have a dedicated
-                // kernel entry point are allowed here.
-                // Usage: export GGML_METAL_Q6K_NR0=128
-                if (const char * env = getenv("GGML_METAL_Q6K_NR0")) {
-                    const int v = atoi(env);
+                if (env_q6k_nr0) {
+                    const int v = atoi(env_q6k_nr0);
                     if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
                         nr0 = v;
-                    }
-                    static bool s_logged_q6k_nr0 = false;
-                    if (!s_logged_q6k_nr0) {
-                        s_logged_q6k_nr0 = true;
-                        GGML_LOG_INFO("%s: Q6_K NR0 override = %d", __func__, (int) nr0);
                     }
                 }
             } break;
         case GGML_TYPE_IQ2_XXS:
+            
             {
                 nsg = N_SG_IQ2_XXS;
                 nr0 = N_R0_IQ2_XXS;
@@ -1205,19 +1215,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         default:
             {
-                //GGML_LOG_ERROR("Asserting on type %d\n", (int)op->src[2]->type); TOTO
                 GGML_LOG_ERROR("Asserting on type %d\n", (int)tsrc0);
-
                 GGML_ABORT("not implemented");
             }
     };
 
     // Q4_K/Q6_K NR0 is compile-time in the Metal kernel. If the user overrides NR0, the host must select
     // a matching kernel entry point (specialized by NR0) to avoid correctness issues.
-    const bool has_q4k_nr0_env = getenv("GGML_METAL_Q4K_NR0") != NULL;
-    const bool has_q6k_nr0_env = getenv("GGML_METAL_Q6K_NR0") != NULL;
-
-    if (tsrc0 == GGML_TYPE_Q4_K && has_q4k_nr0_env && nr0 != N_R0_Q4_K) {
+if (tsrc0 == GGML_TYPE_Q4_K && has_q4k_nr0_env && nr0 != N_R0_Q4_K) {
         const int v = nr0;
         if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
             snprintf(base, 256, "kernel_mul_mv_id_%s_%s_nr0_%d%s",
