@@ -1,14 +1,11 @@
 #import "ggml-metal-device.h"
-
 #import "ggml-impl.h"
-
 #include <Foundation/Foundation.h>
-
 #include <Metal/Metal.h>
-
 #include <stdatomic.h>
-
 #include <dispatch/dispatch.h>
+#include <string.h>
+#include <stdlib.h>
 
 #ifndef OS_OBJECT_USE_OBJC
 #define OS_OBJECT_USE_OBJC 0
@@ -39,6 +36,48 @@ static atomic_uintptr_t g_addr_device = 0x000000400ULL;
 @implementation GGMLMetalClass
 @end
 #endif
+
+// Extract integer parameters encoded in pipeline "name".
+// Supports both "_key_123" and "_key=123" forms.
+static inline int ggml_metal_parse_int_after_key(const char * s, const char * key_eq, const char * key_us) {
+    if (!s) return 0;
+
+    const char * p = NULL;
+
+    if (key_eq) {
+        p = strstr(s, key_eq);
+        if (p) {
+            p += strlen(key_eq);
+            return (int) strtol(p, NULL, 10);
+        }
+    }
+
+    if (key_us) {
+        p = strstr(s, key_us);
+        if (p) {
+            p += strlen(key_us);
+            return (int) strtol(p, NULL, 10);
+        }
+    }
+
+    return 0;
+}
+
+static inline void ggml_metal_pipeline_params_from_name(struct ggml_metal_pipeline_with_params * res, const char * name) {
+    if (!res || !name) return;
+
+    // Common encodings seen in llama.cpp ggml-metal names:
+    //   "..._nr0_32_..." or "..._nr0=32_..."
+    //   "..._nr1_..."    (if present)
+    //   "..._nsg=4_..."  or "..._nsg_4_..." (some codepaths historically used underscore)
+    //   "..._smem=..._..." (optional)
+    res->nr0  = ggml_metal_parse_int_after_key(name, "nr0=",  "nr0_");
+    res->nr1  = ggml_metal_parse_int_after_key(name, "nr1=",  "nr1_");
+    res->nsg  = ggml_metal_parse_int_after_key(name, "nsg=",  "nsg_");
+    res->smem = ggml_metal_parse_int_after_key(name, "smem=", "smem_");
+}
+
+
 
 //
 // MTLFunctionConstantValues wrapper
@@ -389,6 +428,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
     res.pipeline = ggml_metal_pipelines_get(lib->pipelines, name);
     if (res.pipeline) {
+        // Even on cache hits, populate params from encoded name so callers can rely on them.
+        ggml_metal_pipeline_params_from_name(&res, name);
         [lib->lock unlock];
 
         return res;
@@ -450,8 +491,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
         res.pipeline = ggml_metal_pipeline_init();
         res.pipeline->obj = obj;
-
-        ggml_metal_pipelines_add(lib->pipelines, name, res.pipeline);
+        // Populate params for this freshly-compiled pipeline.
+        ggml_metal_pipeline_params_from_name(&res, name);        ggml_metal_pipelines_add(lib->pipelines, name, res.pipeline);
     }
 
     [lib->lock unlock];
