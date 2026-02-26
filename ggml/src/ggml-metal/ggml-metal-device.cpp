@@ -640,7 +640,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
-    const bool is_decode = (ne11 == 1 && ne12 == 1 && ne13 == 1);
+    // Decode path identification must match the _id_ variant (mul_mv_id) to ensure that
+    // GGML_METAL_DECODE_Q4K_NR0/NSG affect BOTH pipelines (id + non-id).
+    //
+    // In llama.cpp, many "matvec decode-like" ops have ne11 == 1 but may carry extra
+    // batching/splitting in ne12/ne13, so restricting decode to (ne12==1 && ne13==1)
+    // causes overrides to be silently ignored.
+    const bool is_decode = (ne11 == 1); //TOTO
     char base[256];
     char name[256];
 
@@ -902,13 +908,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         getenv("GGML_METAL_Q6K_NR0") != NULL || getenv("GGML_METAL_DECODE_Q6K_NR0") != NULL;
 
     if (tsrc0 == GGML_TYPE_Q4_K && has_q4k_nr0_env && nr0 != N_R0_Q4_K) {
-        const int v = nr0;
-        if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+        // NR0 is a compile-time specialization. If the user requests an unsupported value,
+        // clamp it to the nearest supported value <= requested (see ggml_metal_nr0_allowed_leq_()).
+        const int v_req = nr0;
+        const int v     = ggml_metal_nr0_allowed_leq_(v_req);
+    
+        nr0 = v;
+    
+        if (nr0 != N_R0_Q4_K) {
             snprintf(base, 256, "kernel_mul_mv_%s_%s_nr0_%d%s",
-                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), v, suffix);
+                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), nr0, suffix);
         } else {
-            // Unsupported override -> fall back to the default kernel and reset nr0 to the compiled default.
-            nr0 = N_R0_Q4_K;
             snprintf(base, 256, "kernel_mul_mv_%s_%s%s",
                      ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
         }
@@ -1222,14 +1232,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
 
     // Q4_K/Q6_K NR0 is compile-time in the Metal kernel. If the user overrides NR0, the host must select
     // a matching kernel entry point (specialized by NR0) to avoid correctness issues.
-if (tsrc0 == GGML_TYPE_Q4_K && has_q4k_nr0_env && nr0 != N_R0_Q4_K) {
-        const int v = nr0;
-        if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+    if (tsrc0 == GGML_TYPE_Q4_K && has_q4k_nr0_env && nr0 != N_R0_Q4_K) {
+        // NR0 is a compile-time specialization. If the user requests an unsupported value,
+        // clamp it to the nearest supported value <= requested (see ggml_metal_nr0_allowed_leq_()).
+        const int v_req = nr0;
+        const int v     = ggml_metal_nr0_allowed_leq_(v_req);
+    
+        nr0 = v;
+    
+        if (nr0 != N_R0_Q4_K) {
             snprintf(base, 256, "kernel_mul_mv_id_%s_%s_nr0_%d%s",
-                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), v, suffix);
+                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), nr0, suffix);
         } else {
-            // Unsupported override -> fall back to the default kernel and reset nr0 to the compiled default.
-            nr0 = N_R0_Q4_K;
             snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s",
                      ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
         }
