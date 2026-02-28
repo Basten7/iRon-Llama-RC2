@@ -939,8 +939,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     }
 
     snprintf(name, 256, "%s_nsg=%d", base, nsg);
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    // Instrumentation (decode focus): confirm which Q4_K specialization is actually selected. TOTO
+    // Enable with -lv 4 (GGML_LOG_DEBUG).
+    const char * env_q4k_nsg = getenv("GGML_METAL_DECODE_Q4K_NSG");
+    const char * env_q4k_nr0 = getenv("GGML_METAL_DECODE_Q4K_NR0");
+    if (tsrc0 == GGML_TYPE_Q4_K) {
+        GGML_LOG_DEBUG(
+            "%s: Q4_K mul_mv select: base='%s' name='%s' -> nr0=%d nsg=%d (env_nsg='%s' env_nr0='%s' has_nr0_env=%d)\n",
+            __func__, base, name, nr0, nsg,
+            env_q4k_nsg ? env_q4k_nsg : "",
+            env_q4k_nr0 ? env_q4k_nr0 : "",
+            (int) has_q4k_nr0_env);
+    }    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
@@ -955,7 +965,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     res.nr1  = nr1;
     res.nsg  = nsg;
     res.smem = smem;
-
+    
+    // Instrumentation: confirm Q4_K uses the expected mul_mv decode entry points
+    // and that env overrides actually map to a distinct pipeline name.
+    if (tsrc0 == GGML_TYPE_Q4_K && tsrc1 == GGML_TYPE_F32) {
+        const char * env_dec_nsg = getenv("GGML_METAL_DECODE_Q4K_NSG");
+        const char * env_dec_nr0 = getenv("GGML_METAL_DECODE_Q4K_NR0");
+        const char * env_any_nsg = getenv("GGML_METAL_Q4K_NSG");
+        const char * env_any_nr0 = getenv("GGML_METAL_Q4K_NR0");
+    
+        GGML_LOG_DEBUG(
+            "%s: Q4_K mul_mv select: name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | env decode(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
+            __func__, name, res.nr0, res.nr1, res.nsg, res.smem,
+            env_dec_nsg ? env_dec_nsg : "", env_dec_nr0 ? env_dec_nr0 : "",
+            env_any_nsg ? env_any_nsg : "", env_any_nr0 ? env_any_nr0 : "");
+    }
     return res;
 }
 
@@ -1264,7 +1288,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     }
 
     snprintf(name, 256, "%s_nsg=%d", base, nsg);
-
+    // Instrumentation (decode focus): confirm which Q4_K specialization is actually selected.
+    // Enable with -lv 4 (GGML_LOG_DEBUG).
+    if (tsrc0 == GGML_TYPE_Q4_K) {
+        GGML_LOG_DEBUG(
+            "%s: Q4_K mul_mv_id select: base='%s' name='%s' -> nr0=%d nsg=%d (env_nsg='%s' env_nr0='%s' has_nr0_env=%d)\n",
+            __func__, base, name, nr0, nsg,
+            env_q4k_nsg ? env_q4k_nsg : "",
+            env_q4k_nr0 ? env_q4k_nr0 : "",
+            (int) has_q4k_nr0_env);
+    }
+    
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
@@ -1280,7 +1314,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     res.nr1  = nr1;
     res.nsg  = nsg;
     res.smem = smem;
-
+    // Instrumentation: confirm Q4_K uses the expected mul_mv_id decode entry points
+    // and that env overrides actually map to a distinct pipeline name.
+    if (tsrc0 == GGML_TYPE_Q4_K && tsrc1 == GGML_TYPE_F32) {
+        const char * env_dec_nsg = getenv("GGML_METAL_DECODE_Q4K_NSG");
+        const char * env_dec_nr0 = getenv("GGML_METAL_DECODE_Q4K_NR0");
+        const char * env_any_nsg = getenv("GGML_METAL_Q4K_NSG");
+        const char * env_any_nr0 = getenv("GGML_METAL_Q4K_NR0");
+    
+        GGML_LOG_DEBUG(
+            "%s: Q4_K mul_mv_id select: name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | env decode(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
+            __func__, name, res.nr0, res.nr1, res.nsg, res.smem,
+            env_dec_nsg ? env_dec_nsg : "", env_dec_nr0 ? env_dec_nr0 : "",
+            env_any_nsg ? env_any_nsg : "", env_any_nr0 ? env_any_nr0 : "");
+    }
+     
     return res;
 }
 
