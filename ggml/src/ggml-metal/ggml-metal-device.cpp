@@ -956,18 +956,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     res.nsg  = nsg;
     res.smem = smem;
     
-    // Instrumentation (enable with -lv 4): show the *effective* base/name + params.
+    // Instrumentation (enable with -lv 4): show the effective base/name + params, and which envs
+    // were eligible for *this* call (decode-like => DECODE_* takes precedence, else only ANY_*).
     if ((tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q6_K) && tsrc1 == GGML_TYPE_F32) {
         const char * dec_nsg = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_DECODE_Q4K_NSG") : getenv("GGML_METAL_DECODE_Q6K_NSG");
         const char * dec_nr0 = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_DECODE_Q4K_NR0") : getenv("GGML_METAL_DECODE_Q6K_NR0");
         const char * any_nsg = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_Q4K_NSG")        : getenv("GGML_METAL_Q6K_NSG");
         const char * any_nr0 = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_Q4K_NR0")        : getenv("GGML_METAL_Q6K_NR0");
-    
-        GGML_LOG_DEBUG("%s: %s mul_mv select: is_decode=%d base='%s' name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | env dec(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
+        // Which envs were eligible for *this* call:
+        // decode-like => DECODE_* takes precedence, else only ANY_*.
+        const char * used_nsg = is_decode_like ? ((dec_nsg && dec_nsg[0]) ? dec_nsg : any_nsg) : any_nsg;
+        const char * used_nr0 = is_decode_like ? ((dec_nr0 && dec_nr0[0]) ? dec_nr0 : any_nr0) : any_nr0;
+        
+        GGML_LOG_DEBUG("%s: %s mul_mv select: is_decode=%d base='%s' name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
                        __func__,
                        tsrc0 == GGML_TYPE_Q4_K ? "Q4_K" : "Q6_K",
                        (int) is_decode_like, base, name,
                        res.nr0, res.nr1, res.nsg, res.smem,
+                       used_nsg ? used_nsg : "", used_nr0 ? used_nr0 : "",
                        dec_nsg ? dec_nsg : "", dec_nr0 ? dec_nr0 : "",
                        any_nsg ? any_nsg : "", any_nr0 ? any_nr0 : "");
     }
@@ -1328,17 +1334,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     res.nr1  = nr1;
     res.nsg  = nsg;
     res.smem = smem;
-    // Instrumentation: confirm Q4_K uses the expected mul_mv_id decode entry points
-    // and that env overrides actually map to a distinct pipeline name.
+    // Instrumentation: confirm Q4_K mul_mv_id uses the expected entry points and show which envs
+    // were eligible for this call (decode-like => DECODE_* preferred, else only ANY_*).
     if (tsrc0 == GGML_TYPE_Q4_K && tsrc1 == GGML_TYPE_F32) {
         const char * env_dec_nsg = getenv("GGML_METAL_DECODE_Q4K_NSG");
         const char * env_dec_nr0 = getenv("GGML_METAL_DECODE_Q4K_NR0");
         const char * env_any_nsg = getenv("GGML_METAL_Q4K_NSG");
         const char * env_any_nr0 = getenv("GGML_METAL_Q4K_NR0");
-    
+        
+        const char * used_nsg = is_decode_like ? ((env_dec_nsg && env_dec_nsg[0]) ? env_dec_nsg : env_any_nsg) : env_any_nsg;
+        const char * used_nr0 = is_decode_like ? ((env_dec_nr0 && env_dec_nr0[0]) ? env_dec_nr0 : env_any_nr0) : env_any_nr0;
         GGML_LOG_DEBUG(
-            "%s: Q4_K mul_mv_id select: name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | env decode(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
-            __func__, name, res.nr0, res.nr1, res.nsg, res.smem,
+                       "%s: Q4_K mul_mv_id select: is_decode=%d name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
+                       __func__, (int) is_decode_like, name, res.nr0, res.nr1, res.nsg, res.smem,
+                       used_nsg ? used_nsg : "", used_nr0 ? used_nr0 : "",
             env_dec_nsg ? env_dec_nsg : "", env_dec_nr0 ? env_dec_nr0 : "",
             env_any_nsg ? env_any_nsg : "", env_any_nr0 ? env_any_nr0 : "");
     }
