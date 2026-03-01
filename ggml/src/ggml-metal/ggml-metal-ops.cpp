@@ -8,6 +8,9 @@
 #include <cstring>
 #include <strings.h>
 
+// DIAG op support (needed by RPC graphs)
+static int ggml_metal_op_diag(ggml_metal_op_t ctx, int idx);
+
 // Flash-Attention debug/override knobs (env):
 //  - GGML_METAL_FA_VEC = 0|1|auto   (override vec path selection; default: auto)
 //  - GGML_METAL_FA_NSG = <int>      (override nsg for FA kernels; 0 disables override)
@@ -248,7 +251,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             } break;
     }
 
-    if (!ggml_metal_device_supports_op(ctx->dev, node)) {
+    if (node->op != GGML_OP_DIAG && !ggml_metal_device_supports_op(ctx->dev, node)) {
         GGML_LOG_ERROR("%s: error: unsupported op '%s'\n", __func__, ggml_op_desc(node));
         GGML_ABORT("unsupported op");
     }
@@ -316,6 +319,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_CONCAT:
             {
                 n_fuse = ggml_metal_op_concat(ctx, idx);
+            } break;
+            case GGML_OP_DIAG:
+                  {
+                         n_fuse = ggml_metal_op_diag(ctx, idx);
             } break;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
@@ -4362,6 +4369,62 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
     }
+
+    return 1;
+}
+// -------------------------
+// DIAG: build a diagonal matrix from a vector (F32 only)
+// src0: [n,1,1,1] -> dst: [n,n,1,1]
+// -------------------------
+typedef struct {
+    int64_t  n;
+    uint64_t nb00;
+    uint64_t nb0;
+    uint64_t nb1;
+} ggml_metal_kargs_diag;
+
+static int ggml_metal_op_diag(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type         == GGML_TYPE_F32);
+
+    // ggml_diag(): src0 is a vector (ne01 == 1), dst is a square matrix (ne0 == ne1 == ne00).
+    GGML_ASSERT(ne01 == 1);
+    GGML_ASSERT(ne0  == ne00);
+    GGML_ASSERT(ne1  == ne00);
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, "kernel_diag_f32");
+
+    const int64_t n  = ne00;
+    const int64_t np = n * n;
+
+    ggml_metal_kargs_diag args = {
+        /*.n   =*/ n,
+        /*.nb00=*/ nb00,
+        /*.nb0 =*/ nb0,
+        /*.nb1 =*/ nb1,
+    };
+
+    int ida = 0;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++);
+
+    const int nth_max = (int) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
+    const int nth     = nth_max > 256 ? 256 : nth_max;
+    const int64_t n_tg = (np + nth - 1) / nth;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) n_tg, 1, 1, nth, 1, 1);
 
     return 1;
 }

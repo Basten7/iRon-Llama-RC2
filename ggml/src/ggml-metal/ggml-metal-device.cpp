@@ -1345,9 +1345,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         const char * used_nsg = is_decode_like ? ((env_dec_nsg && env_dec_nsg[0]) ? env_dec_nsg : env_any_nsg) : env_any_nsg;
         const char * used_nr0 = is_decode_like ? ((env_dec_nr0 && env_dec_nr0[0]) ? env_dec_nr0 : env_any_nr0) : env_any_nr0;
         GGML_LOG_DEBUG(
-                       "%s: Q4_K mul_mv_id select: is_decode=%d name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
-                       __func__, (int) is_decode_like, name, res.nr0, res.nr1, res.nsg, res.smem,
-                       used_nsg ? used_nsg : "", used_nr0 ? used_nr0 : "",
+            "%s: Q4_K mul_mv_id select: is_decode=%d name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
+            __func__, (int) is_decode_like, name, res.nr0, res.nr1, res.nsg, res.smem,
+            used_nsg ? used_nsg : "", used_nr0 ? used_nr0 : "",
             env_dec_nsg ? env_dec_nsg : "", env_dec_nr0 ? env_dec_nr0 : "",
             env_any_nsg ? env_any_nsg : "", env_any_nr0 ? env_any_nr0 : "");
     }
