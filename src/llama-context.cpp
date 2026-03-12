@@ -7,10 +7,12 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "ggml-metal.h"
 
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -210,12 +212,50 @@ llama_context::llama_context(
 
     if (!hparams.vocab_only) {
         // GPU backends
-        for (auto * dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-            if (backend == nullptr) {
-                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+        const char * env_metal = getenv("GGML_METAL_DEVICE_INDEX");
+        const bool want_metal_list = (env_metal != nullptr) && (strchr(env_metal, ',') != nullptr);
+        
+        const bool all_metal =
+            !model.devices.empty() &&
+            std::all_of(model.devices.begin(), model.devices.end(), [](ggml_backend_dev_t dev) {
+                const char * name = ggml_backend_dev_name(dev);
+                return name != nullptr && strcmp(name, "Metal") == 0;
+            });
+        
+        if (want_metal_list && all_metal) {
+            // Instantiate one Metal backend per registered Metal device (registry order follows GGML_METAL_DEVICE_INDEX).
+            // We try indices 0..7 and stop on first failure.
+            size_t n_metal = 0;
+            for (size_t i = 0; i < 8; ++i) {
+                ggml_backend_t backend = ggml_backend_metal_init_by_index(i);
+                if (backend == nullptr) {
+                    break;
+                }
+                backends.emplace_back(backend);
+                ++n_metal;
             }
-            backends.emplace_back(backend);
+        
+            if (n_metal == 0) {
+                // Fallback to legacy path if Metal-by-index init is unavailable for some reason.
+                for (auto * dev : model.devices) {
+                    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+                    if (backend == nullptr) {
+                        throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+                    }
+                    backends.emplace_back(backend);
+                }
+            } else {
+                LLAMA_LOG_INFO("%s: Metal MGPU: instantiated %zu Metal backends (GGML_METAL_DEVICE_INDEX='%s')\n",
+                               __func__, n_metal, env_metal ? env_metal : "");
+            }
+        } else {
+            for (auto * dev : model.devices) {
+                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+                }
+                backends.emplace_back(backend);
+            }
         }
 
         // add ACCEL backends (such as BLAS)

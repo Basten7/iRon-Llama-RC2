@@ -41,6 +41,7 @@ extern "C" {
 
 // TODO: remove in the future
 GGML_BACKEND_API ggml_backend_t ggml_backend_metal_init(void);
+GGML_BACKEND_API ggml_backend_t ggml_backend_metal_init_by_index(size_t reg_dev_index);
 
 GGML_BACKEND_API bool ggml_backend_is_metal(ggml_backend_t backend);
 

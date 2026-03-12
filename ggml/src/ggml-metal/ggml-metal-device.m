@@ -1845,8 +1845,26 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         // Keep buf_src alive until GPU finished consuming it, then release.
         [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             if (cb.error) {
-                GGML_ABORT("ggml_metal_buffer_set_tensor: blit failed: %s",
-                           cb.error.localizedDescription.UTF8String);
+                const bool no_abort = getenv("GGML_METAL_BLIT_NO_ABORT") != NULL;
+                NSError * err = cb.error;
+                // Print rich error info (domain/code/desc). Some driver failures only show up here.
+                GGML_LOG_ERROR("ggml_metal_buffer_set_tensor: blit failed: %s\n",
+                               err.localizedDescription.UTF8String);
+                GGML_LOG_ERROR("ggml_metal_buffer_set_tensor: NSError domain=%s code=%ld desc=%s\n",
+                               err.domain.UTF8String,
+                               (long) err.code,
+                               err.localizedDescription.UTF8String);
+                // Try to include device name if available
+                // TOTO if (buf && buf->dev && buf->dev->props.name) {
+                if (buf && buf->dev && buf->dev->props.name[0] != '\0') {
+                    GGML_LOG_ERROR("ggml_metal_buffer_set_tensor: device=%s\n", buf->dev->props.name);
+                }
+                GGML_LOG_ERROR("ggml_metal_buffer_set_tensor: copy size=%zu dst_offset=%zu need_sync=%d\n",
+                               (size_t) size, (size_t) bid_dst.offs, (int) need_sync);
+                
+                if (!no_abort) {
+                    GGML_ABORT("ggml_metal_buffer_set_tensor: blit failed (set GGML_METAL_BLIT_NO_ABORT=1 to continue)");
+                }
             }
             [buf_src release];
             if (sem) {

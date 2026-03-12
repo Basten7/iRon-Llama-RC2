@@ -230,6 +230,10 @@ void ggml_metal_device_free(ggml_metal_device_t dev);
 // return a singleton that is automatically destroyed when the program exits
 ggml_metal_device_t ggml_metal_device_get(void);
 
+// MGPU groundwork: get a Metal device instance for a specific device index.
+// C-safe name (no overloading): use this for multi-backend Metal registration.
+ggml_metal_device_t ggml_metal_device_get_by_index(int device_index);
+
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
 

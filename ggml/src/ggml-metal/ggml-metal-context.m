@@ -1,4 +1,4 @@
-#import "ggml-metal-context.h"
+
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
@@ -12,6 +12,21 @@
 #import <Metal/Metal.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#import "ggml-metal-context.h"
+
+// Obj-C (.m) friendly helper: no C++ 'auto', no blocks.
+static inline const char * ggml_metal_cmd_status_name(MTLCommandBufferStatus s) {
+    switch (s) {
+        case MTLCommandBufferStatusNotEnqueued: return "NotEnqueued";
+        case MTLCommandBufferStatusEnqueued:    return "Enqueued";
+        case MTLCommandBufferStatusCommitted:   return "Committed";
+        case MTLCommandBufferStatusScheduled:   return "Scheduled";
+        case MTLCommandBufferStatusCompleted:   return "Completed";
+        case MTLCommandBufferStatusError:       return "Error";
+        default:                                return "Unknown";
+    }
+}
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -239,27 +254,41 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         ctx->cmd_buf_last = nil;
     }
 
+    const bool no_abort = getenv("GGML_METAL_SYNC_NO_ABORT") != NULL;
+
     // check status of all command buffers
     {
         const int n_cb = ctx->n_cb;
 
-        for (int cb_idx = 0; cb_idx <= n_cb; ++cb_idx) {
+        for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
             id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
-            if (!cmd_buf) {
-                continue;
-            }
+            if (!cmd_buf) continue;
 
             MTLCommandBufferStatus status = [cmd_buf status];
-            if (status == MTLCommandBufferStatusNotEnqueued) {
-                continue;
-            }
+            if (status == MTLCommandBufferStatusNotEnqueued) continue;
+
             if (status != MTLCommandBufferStatusCompleted) {
+                GGML_LOG_ERROR("%s: cb[%d]=%p status(before)=%d(%s)\n", __func__, cb_idx, (void *) cmd_buf, (int) status, ggml_metal_cmd_status_name(status));
                 [cmd_buf waitUntilCompleted];
                 status = [cmd_buf status];
+                GGML_LOG_ERROR("%s: cb[%d]=%p status(after) =%d(%s)\n", __func__, cb_idx, (void *) cmd_buf, (int) status, ggml_metal_cmd_status_name(status));
             }
-            if (status != MTLCommandBufferStatusCompleted) {                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
-                if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+
+            if (status != MTLCommandBufferStatusCompleted) {
+                NSError * err = [cmd_buf error];
+                GGML_LOG_ERROR("%s: error: command buffer %d did not complete (status=%d/%s)\n",
+                                __func__, cb_idx, (int) status, ggml_metal_cmd_status_name(status));
+                if (err) {
+                    GGML_LOG_ERROR("%s: cb[%d] NSError domain=%s code=%ld desc=%s\n",
+                                   __func__, cb_idx,
+                                   [[err domain] UTF8String],
+                                   (long) [err code],
+                                   [[err localizedDescription] UTF8String]);
+                }
+
+                if (no_abort) {
+                    GGML_LOG_ERROR("%s: GGML_METAL_SYNC_NO_ABORT=1 -> returning early (non-fatal)\n", __func__);
+                    return;
                 }
                 GGML_ABORT("fatal error");
             }
@@ -276,13 +305,28 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
                 [cmd_buf release];
                 continue;
             }
+
             if (status != MTLCommandBufferStatusCompleted) {
                 [cmd_buf waitUntilCompleted];
                 status = [cmd_buf status];
             }
-            if (status != MTLCommandBufferStatusCompleted) {                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
-                if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+
+            if (status != MTLCommandBufferStatusCompleted) {
+                NSError * err = [cmd_buf error];
+                GGML_LOG_ERROR("%s: error: ext command buffer %zu did not complete (status=%d/%s)\n",
+                                __func__, i, (int) status, ggml_metal_cmd_status_name(status));
+                if (err) {
+                    GGML_LOG_ERROR("%s: ext[%zu] NSError domain=%s code=%ld desc=%s\n",
+                                   __func__, i,
+                                   [[err domain] UTF8String],
+                                   (long) [err code],
+                                   [[err localizedDescription] UTF8String]);
+                }
+
+                if (no_abort) {
+                    GGML_LOG_ERROR("%s: GGML_METAL_SYNC_NO_ABORT=1 -> continuing cleanup (non-fatal)\n", __func__);
+                    [cmd_buf release];
+                    continue;
                 }
                 GGML_ABORT("fatal error");
             }

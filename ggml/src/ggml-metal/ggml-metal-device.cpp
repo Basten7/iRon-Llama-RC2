@@ -5,13 +5,13 @@
 #include "ggml-metal-impl.h"
 
 #include "ggml-impl.h"
-
+#include <cstdio>
 #include <cassert>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <cstdlib>
-
+#include <mutex>
 
 
 // -----------------------------------------------------------------------------
@@ -52,27 +52,86 @@ struct ggml_metal_device_deleter {
 
 typedef std::unique_ptr<ggml_metal_device, ggml_metal_device_deleter> ggml_metal_device_ptr;
 
-ggml_metal_device_t ggml_metal_device_get(void) {
-    static std::once_flag s_once;
-    static ggml_metal_device_ptr s_dev;
-    
-    std::call_once(s_once, []() {
-        s_dev.reset(ggml_metal_device_init());
-        if (!s_dev) {
-            GGML_LOG_ERROR("ggml-metal: ggml_metal_device_init() returned NULL\n");
+
+struct ggml_metal_env_guard {
+    std::string key;
+    std::string prev;
+    bool        had_prev = false;
+
+    ggml_metal_env_guard(const char * k, const char * v) : key(k) {
+        const char * p = getenv(k);
+        if (p) { had_prev = true; prev = p; }
+        if (v) setenv(k, v, 1);
+        else   unsetenv(k);
+    }
+
+    ~ggml_metal_env_guard() {
+        if (had_prev) setenv(key.c_str(), prev.c_str(), 1);
+        else          unsetenv(key.c_str());
+    }
+};
+
+static std::mutex s_env_mutex;
+
+struct ggml_metal_device_slot {
+    std::once_flag        once;
+    ggml_metal_device_ptr dev;
+};
+
+static std::unordered_map<int, ggml_metal_device_slot> & ggml_metal_device_slots() {
+    static std::unordered_map<int, ggml_metal_device_slot> s_slots;
+    return s_slots;
+}
+static std::mutex s_slots_mutex;
+static ggml_metal_device_t ggml_metal_device_init_for_index_(int device_index) {
+    std::lock_guard<std::mutex> lock(s_env_mutex);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", device_index);
+    ggml_metal_env_guard guard("GGML_METAL_DEVICE_INDEX", buf);
+    return ggml_metal_device_init();
+}
+
+static int ggml_metal_parse_first_device_index_() {
+    // Legacy behavior: GGML_METAL_DEVICE_INDEX can be a single int.
+    // If a comma-separated list is used (MGPU experiments), first entry is the default.
+    const char * v = getenv("GGML_METAL_DEVICE_INDEX");
+    if (!v || !v[0]) return 0;
+    char tmp[32];
+    size_t n = 0;
+    while (v[n] && v[n] != ',' && v[n] != ' ' && v[n] != '\t' && n + 1 < sizeof(tmp)) {
+        tmp[n] = v[n];
+        n++;
+    }
+    tmp[n] = '\0';
+    return atoi(tmp);
+}
+
+ggml_metal_device_t ggml_metal_device_get_by_index(int device_index) {
+    std::lock_guard<std::mutex> lock_slots(s_slots_mutex);
+    auto & slots = ggml_metal_device_slots();
+    auto & slot  = slots[device_index];
+
+    std::call_once(slot.once, [&]() {
+        slot.dev.reset(ggml_metal_device_init_for_index_(device_index));
+        if (!slot.dev) {
+            GGML_LOG_ERROR("ggml-metal: ggml_metal_device_init() returned NULL (device_index=%d)\n", device_index);
         }
     });
-    
-    // Defensive: allow a best-effort retry if first init failed (rare, but prevents NULL being sticky forever)
-    if (!s_dev) {
-        ggml_metal_device_t tmp = ggml_metal_device_init();
+
+    // Defensive retry if init failed.
+    if (!slot.dev) {
+        ggml_metal_device_t tmp = ggml_metal_device_init_for_index_(device_index);
         if (tmp) {
-            s_dev.reset(tmp);
-            GGML_LOG_ERROR("ggml-metal: device init succeeded on retry\n");
+            slot.dev.reset(tmp);
+            GGML_LOG_ERROR("ggml-metal: device init succeeded on retry (device_index=%d)\n", device_index);
         }
     }
-    
-    return s_dev.get();
+
+    return slot.dev.get();
+}
+
+ggml_metal_device_t ggml_metal_device_get(void) {
+    return ggml_metal_device_get_by_index(ggml_metal_parse_first_device_index_());
 }
 
 struct ggml_metal_pipelines {

@@ -2474,7 +2474,42 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
     const auto & tensor_split = params.tensor_split;
-
+    // Metal MGPU:
+    // If ggml-metal registered multiple devices via GGML_METAL_DEVICE_INDEX (list),
+    // ensure `devices` contains all Metal devices so that layer placement can be split.
+    //
+    // Without this, llama instantiates a single Metal backend and all weights land on one GPU.
+    if (!devices.empty()) {
+        const char * env_metal = getenv("GGML_METAL_DEVICE_INDEX");
+        const bool want_mgpu = env_metal && strchr(env_metal, ',');
+    
+        const char * d0_name = ggml_backend_dev_name(devices[0]);
+        const bool is_metal0 = d0_name && strcmp(d0_name, "Metal") == 0;
+    
+        // Only expand when the model currently has a single Metal device.
+        if (want_mgpu && is_metal0 && devices.size() == 1) {
+            std::vector<ggml_backend_dev_t> metal_devs;
+            metal_devs.reserve(8);
+    
+            // Enumerate all backend devices and pick Metal ones (registry order follows GGML_METAL_DEVICE_INDEX).
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (!dev) continue;
+    
+                const char * name = ggml_backend_dev_name(dev);
+                if (name && strcmp(name, "Metal") == 0) {
+                    metal_devs.push_back(dev);
+                }
+            }
+    
+            if (metal_devs.size() > 1) {
+                LLAMA_LOG_INFO("%s: Metal MGPU: using %zu Metal devices (GGML_METAL_DEVICE_INDEX='%s')\n",
+                               __func__, metal_devs.size(), env_metal ? env_metal : "");
+                devices = std::move(metal_devs);
+            }
+        }
+    }
+    
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
 
