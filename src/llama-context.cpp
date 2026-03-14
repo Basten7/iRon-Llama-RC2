@@ -211,62 +211,53 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
-        // GPU backends
-        const char * env_metal = getenv("GGML_METAL_DEVICE_INDEX");
-        const bool want_metal_list = (env_metal != nullptr) && (strchr(env_metal, ',') != nullptr);
-        
-        const bool all_metal =
-            !model.devices.empty() &&
+        // Detect strict Metal MGPU mode from the model-selected devices.
+        const bool metal_mgpu =
+            model.devices.size() > 1 &&
             std::all_of(model.devices.begin(), model.devices.end(), [](ggml_backend_dev_t dev) {
                 const char * name = ggml_backend_dev_name(dev);
                 return name != nullptr && strcmp(name, "Metal") == 0;
             });
         
-        if (want_metal_list && all_metal) {
-            // Instantiate one Metal backend per registered Metal device (registry order follows GGML_METAL_DEVICE_INDEX).
-            // We try indices 0..7 and stop on first failure.
-            size_t n_metal = 0;
-            for (size_t i = 0; i < 8; ++i) {
-                ggml_backend_t backend = ggml_backend_metal_init_by_index(i);
-                if (backend == nullptr) {
-                    break;
+        // GPU backends
+        // In Metal MGPU mode, instantiate backends strictly from model.devices only.
+        // Do not allow any extra/global Metal backend to slip into the scheduler path.
+        for (auto * dev : model.devices) {
+            if (metal_mgpu) {
+                const char * name = ggml_backend_dev_name(dev);
+                if (name == nullptr || strcmp(name, "Metal") != 0) {
+                    continue;
                 }
-                backends.emplace_back(backend);
-                ++n_metal;
             }
         
-            if (n_metal == 0) {
-                // Fallback to legacy path if Metal-by-index init is unavailable for some reason.
-                for (auto * dev : model.devices) {
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+            if (backend == nullptr) {
+                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+            }
+            backends.emplace_back(backend);
+        }
+
+
+        
+        if (!metal_mgpu) {
+            // add ACCEL backends (such as BLAS)
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
                     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
                     if (backend == nullptr) {
                         throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
                     }
                     backends.emplace_back(backend);
                 }
-            } else {
-                LLAMA_LOG_INFO("%s: Metal MGPU: instantiated %zu Metal backends (GGML_METAL_DEVICE_INDEX='%s')\n",
-                               __func__, n_metal, env_metal ? env_metal : "");
             }
         } else {
+            LLAMA_LOG_INFO("%s: Metal MGPU detected -> skipping ACCEL backends (BLAS)\n", __func__);
             for (auto * dev : model.devices) {
-                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-                if (backend == nullptr) {
-                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
-                }
-                backends.emplace_back(backend);
-            }
-        }
-
-        // add ACCEL backends (such as BLAS)
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-                if (backend == nullptr) {
-                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
-                }
-                backends.emplace_back(backend);
+                LLAMA_LOG_INFO("%s: Metal MGPU backend[%p] = %s\n",
+                        __func__,
+                        (void *) dev,
+                        ggml_backend_dev_name(dev));
             }
         }
 
@@ -321,17 +312,32 @@ llama_context::llama_context(
         backend_buft.clear();
         backend_ptrs.clear();
         backend_buf_exp_size.clear();
+        ggml_backend_buffer_type_t cpu_fallback_buft = nullptr;
 
         for (auto & backend : backends) {
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
-                // use the host buffer of the first device CPU for faster transfer of the intermediate state
-                auto * dev = model.devices[0];
-                auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
-                if (host_buft) {
-                    buft = host_buft;
+                // Prefer a host-visible buffer associated with one of the active model devices
+                // for faster CPU <-> GPU staging of intermediate tensors.
+                //
+                // In single-GPU mode this behaves like the old code.
+                // In MGPU mode, do not hard-bind staging to model.devices[0]:
+                // pick the first valid host buffer among the actually active devices and
+                // keep it stable for the CPU backend during this context lifetime.
+                if (cpu_fallback_buft == nullptr) {
+                    for (auto * dev : model.devices) {
+                        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+                        if (host_buft) {
+                            cpu_fallback_buft = host_buft;
+                            break;
+                        }
+                    }
+                }
+                
+                if (cpu_fallback_buft != nullptr) {
+                    buft = cpu_fallback_buft;
                 }
             }
 
