@@ -122,7 +122,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: ctx=%p dev=%p\n", __func__, (void *) res, (void *) res->dev); //Debug Log TOTO
     
     id<MTLDevice> device = ggml_metal_device_get_obj(dev);
-    GGML_LOG_INFO("%s: picking default device: %s\n", __func__, [[device name] UTF8String]);
+    GGML_LOG_INFO("%s: using requested device: %s\n", __func__, [[device name] UTF8String]);
 
     // Use per-device queue (your design choice)
     id<MTLCommandQueue> queue = ggml_metal_device_get_queue(dev);
@@ -131,7 +131,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         free(res);
         return NULL;
     }
-
+    res->cmd_bufs_ext = [[NSMutableArray alloc] init];
     res->lib = ggml_metal_device_get_library(dev);
     if (res->lib == NULL) {
         GGML_LOG_WARN("%s: the device does not have a precompiled Metal library - this is unexpected\n", __func__);
@@ -362,9 +362,14 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
         if (bid_dst.metal == nil) {
             GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
         }
-
-        bid_dst.offs += offset;
-
+        id<MTLDevice> dst_dev = [(id<MTLBuffer>) bid_dst.metal device];
+        if (dst_dev != device) {
+            GGML_LOG_ERROR("%s: device mismatch for tensor '%s': ctx_dev=%p(%s) dst_buf_dev=%p(%s)\n",
+                           __func__, tensor->name,
+                           (void *) device, [[device name] UTF8String],
+                           (void *) dst_dev, [[dst_dev name] UTF8String]);
+            GGML_ABORT("fatal error");        bid_dst.offs += offset;
+        }
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);

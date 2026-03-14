@@ -326,6 +326,7 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
 static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
+    std::set<ggml_backend_buffer_type_t> seen_host_bufts;
 
     // add ACCEL buffer types
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -342,15 +343,13 @@ static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & de
     // add a host buffer type
     // storing the tensors in a host buffer is useful when the processing of large batches
     // is offloaded to a GPU device, since it reduces the time spent on data transfers
-    // generally, this will be done using the first device in the list
-    // a better approach would be to handle this on a weight-by-weight basis using the offload_op
-    // function of the device to determine if it would benefit from being stored in a host buffer
+    // in MGPU mode, do not stop at the first device: expose the host-visible buffer types
+    // of all active devices so buffer selection is not implicitly pinned to devices[0]
     if (!no_host) {
         for (auto * dev : devices) {
             ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
-            if (buft) {
+            if (buft && seen_host_bufts.insert(buft).second) {
                 buft_list.emplace_back(dev, buft);
-                break;
             }
         }
     }
@@ -2474,24 +2473,55 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
     const auto & tensor_split = params.tensor_split;
-    // Metal MGPU:
-    // If ggml-metal registered multiple devices via GGML_METAL_DEVICE_INDEX (list),
-    // ensure `devices` contains all Metal devices so that layer placement can be split.
+//    // Metal MGPU:
+//    // If ggml-metal registered multiple devices via GGML_METAL_DEVICE_INDEX (list),
+//    // ensure `devices` contains all Metal devices so that layer placement can be split.
+//    //
+//    // Without this, llama instantiates a single Metal backend and all weights land on one GPU.
+//    if (!devices.empty()) {
+//        const char * env_metal = getenv("GGML_METAL_DEVICE_INDEX");
+//        const bool want_mgpu = env_metal && strchr(env_metal, ',');
+//    
+//        const char * d0_name = ggml_backend_dev_name(devices[0]);
+//        const bool is_metal0 = d0_name && strcmp(d0_name, "Metal") == 0;
+//    
+//        // Only expand when the model currently has a single Metal device.
+//        if (want_mgpu && is_metal0 && devices.size() == 1) {
+//            std::vector<ggml_backend_dev_t> metal_devs;
+//            metal_devs.reserve(8);
+//    
+//            // Enumerate all backend devices and pick Metal ones (registry order follows GGML_METAL_DEVICE_INDEX).
+//            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+//                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+//                if (!dev) continue;
+//    
+//                const char * name = ggml_backend_dev_name(dev);
+//                if (name && strcmp(name, "Metal") == 0) {
+//                    metal_devs.push_back(dev);
+//                }
+//            }
+//    
+//            if (metal_devs.size() > 1) {
+//                LLAMA_LOG_INFO("%s: Metal MGPU: using %zu Metal devices (GGML_METAL_DEVICE_INDEX='%s')\n",
+//                               __func__, metal_devs.size(), env_metal ? env_metal : "");
+//                devices = std::move(metal_devs);
+//            }
+//        }
+//    }
+    // Metal MGPU: if the user provides a list in GGML_METAL_DEVICE_INDEX (e.g. "1,2"),
+    // ensure that `devices` contains *all* Metal backend devices. Otherwise, the model
+    // ends up with a single Metal device and nothing is actually split.
     //
-    // Without this, llama instantiates a single Metal backend and all weights land on one GPU.
-    if (!devices.empty()) {
+    // This is intentionally done inside load_tensors() so it is applied before we compute
+    // splits / choose per-layer buffer types.
+    {
         const char * env_metal = getenv("GGML_METAL_DEVICE_INDEX");
-        const bool want_mgpu = env_metal && strchr(env_metal, ',');
+        const bool want_mgpu = (env_metal != NULL) && (strchr(env_metal, ',') != NULL);
     
-        const char * d0_name = ggml_backend_dev_name(devices[0]);
-        const bool is_metal0 = d0_name && strcmp(d0_name, "Metal") == 0;
-    
-        // Only expand when the model currently has a single Metal device.
-        if (want_mgpu && is_metal0 && devices.size() == 1) {
+        if (want_mgpu) {
             std::vector<ggml_backend_dev_t> metal_devs;
             metal_devs.reserve(8);
     
-            // Enumerate all backend devices and pick Metal ones (registry order follows GGML_METAL_DEVICE_INDEX).
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                 if (!dev) continue;
@@ -2502,14 +2532,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 }
             }
     
+            // Replace `devices` only if we found more than one Metal device.
+            // (Avoid breaking non-Metal setups or single-device Metal.)
             if (metal_devs.size() > 1) {
-                LLAMA_LOG_INFO("%s: Metal MGPU: using %zu Metal devices (GGML_METAL_DEVICE_INDEX='%s')\n",
-                               __func__, metal_devs.size(), env_metal ? env_metal : "");
                 devices = std::move(metal_devs);
+                LLAMA_LOG_INFO("%s: Metal MGPU: using %zu Metal devices (GGML_METAL_DEVICE_INDEX='%s')\n",
+                               __func__, devices.size(), env_metal ? env_metal : "");
+                for (size_t i = 0; i < devices.size(); ++i) {
+                    LLAMA_LOG_INFO("%s: Metal MGPU: dev[%zu]=%p name=%s\n",
+                                   __func__, i, (void *) devices[i], ggml_backend_dev_name(devices[i]));
+                }
             }
         }
     }
-    
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
 
@@ -2570,12 +2605,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < int(hparams.n_layer) && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
-            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s dev=%p, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), (void *) cpu_dev, is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu);
-        LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
+        LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s dev=%p, is_swa = %d\n", il, ggml_backend_dev_name(dev), (void *) dev, is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
@@ -2601,8 +2636,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
-        }
+            if (lhs == rhs) {
+            return false;
+            }
+            const char * lhs_name = ggml_backend_buft_name(lhs);
+            const char * rhs_name = ggml_backend_buft_name(rhs);
+            const int name_cmp = strcmp(lhs_name, rhs_name);
+            if (name_cmp != 0) {
+            return name_cmp < 0;
+            }
+            // MGPU fix:
+            // several Metal buffer types are per-device but share the same textual name
+            // ("Metal", "Metal_Private"). Using only the name collapses distinct per-device
+            // bufts into a single map entry and can concentrate allocations onto one GPU.
+            return lhs < rhs;        }
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
