@@ -7,6 +7,7 @@
 #include "ggml-metal-ops.h"
 #include <vector>
 #include <string>
+#include <cstdio>
 #include <mutex>
 #include <cctype>
 #include <unordered_map>
@@ -14,11 +15,164 @@
 // globals
 
 
+static bool ggml_metal_env_offload_debug_(void) {
+    const char * v = getenv("GGML_METAL_OFFLOAD_DEBUG");
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+static bool ggml_metal_env_trace_ops_(void) {
+    const char * v = getenv("GGML_METAL_TRACE_OPS");
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+static const char * ggml_metal_op_name_trace_(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_MUL_MAT:        return "MUL_MAT";
+        case GGML_OP_MUL_MAT_ID:     return "MUL_MAT_ID";
+        case GGML_OP_ADD_ID:         return "ADD_ID";
+        case GGML_OP_FLASH_ATTN_EXT: return "FLASH_ATTN_EXT";
+        default:                     return "OTHER";
+    }
+}
+
+static void ggml_metal_trace_op_decision_(
+        const char * where,
+        ggml_backend_dev_t dev,
+        const ggml_tensor * op,
+        int64_t bs,
+        int decision,
+        const char * reason) {
+    if (!ggml_metal_env_trace_ops_()) {
+        return;
+    }
+
+    const char * dev_name = ggml_backend_dev_description(dev);
+    const char * op_name  = op ? ggml_metal_op_name_trace_(op->op) : "(null)";
+    const char * tname    = (op && op->name[0]) ? op->name : "(unnamed)";
+
+    fprintf(stderr,
+        "ggml-metal trace: where=%s dev='%s' op=%s tensor='%s' bs=%lld ne=[%lld,%lld,%lld,%lld] decision=%d reason=%s\n",
+        where ? where : "(null)",
+        dev_name ? dev_name : "(unknown)",
+        op_name,
+        tname,
+        (long long) bs,
+        (long long) (op ? op->ne[0] : -1),
+        (long long) (op ? op->ne[1] : -1),
+        (long long) (op ? op->ne[2] : -1),
+        (long long) (op ? op->ne[3] : -1),
+        decision,
+        reason ? reason : "(none)");
+}
+static const char * ggml_metal_op_name_(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_MUL_MAT:        return "MUL_MAT";
+        case GGML_OP_MUL_MAT_ID:     return "MUL_MAT_ID";
+        case GGML_OP_ADD_ID:         return "ADD_ID";
+        case GGML_OP_FLASH_ATTN_EXT: return "FLASH_ATTN_EXT";
+        default:                     return "OTHER";
+    }
+}
+
+static void ggml_metal_log_offload_decision_(
+        ggml_backend_dev_t dev,
+        const ggml_tensor * op,
+        int64_t bs,
+        bool decision,
+                                             const char * reason) {
+    if (!ggml_metal_env_offload_debug_()) {
+        return;
+    }
+    
+    const char * tensor_name = op && op->name[0] ? op->name : "(unnamed)";
+    const char * op_name     = op ? ggml_metal_op_name_(op->op) : "(null)";
+    const char * dev_name    = ggml_backend_dev_description(dev);
+    
+    const int64_t ne0 = op ? op->ne[0] : -1;
+    const int64_t ne1 = op ? op->ne[1] : -1;
+    const int64_t ne2 = op ? op->ne[2] : -1;
+    const int64_t ne3 = op ? op->ne[3] : -1;
+    
+    //    GGML_LOG_INFO(
+    //        "ggml-metal offload: dev='%s' op=%s tensor='%s' bs=%lld ne=[%lld,%lld,%lld,%lld] -> %s (%s)\n",
+    //        dev_name ? dev_name : "(unknown)",
+    //        op_name,
+    //        tensor_name,
+    //        (long long) bs,
+    //        (long long) ne0,
+    //        (long long) ne1,
+    //        (long long) ne2,
+    //        (long long) ne3,
+    //        decision ? "METAL" : "CPU",
+    //        reason ? reason : "no-reason");
+    
+    fprintf(stderr,
+            "ggml-metal offload: dev='%s' op=%s tensor='%s' bs=%lld ne=[%lld,%lld,%lld,%lld] -> %s (%s)\n",
+            dev_name ? dev_name : "(unknown)",
+            op_name,
+            tensor_name,
+            (long long) bs,
+            (long long) ne0,
+            (long long) ne1,
+            (long long) ne2,
+            (long long) ne3,
+            decision ? "METAL" : "CPU",
+            reason ? reason : "no-reason");
+}
+static bool ggml_metal_op_is_decode_like_(const ggml_tensor * op) {
+    if (op == NULL) {
+        return false;
+    }
+
+    if (op->op == GGML_OP_MUL_MAT) {
+        return op->ne[1] <= 1;
+    }
+    if (op->op == GGML_OP_MUL_MAT_ID) {
+        return op->ne[2] <= 1;
+    }
+    return false;
+}
+
+static int ggml_metal_env_mgpu_small_mat_offload_max_bs_(void) {
+    const char * v = getenv("GGML_METAL_MGPU_SMALL_MAT_OFFLOAD_MAX_BS");
+    if (v == NULL || v[0] == '\0') {
+        return -1; // disabled by default
+    }
+
+    const int x = atoi(v);
+    if (x < 0) return -1;
+    return x;
+}
+
+static int ggml_metal_env_mgpu_decode_offload_min_bs_(void) {
+    const char * v = getenv("GGML_METAL_MGPU_DECODE_OFFLOAD_MIN_BS");
+    if (v == NULL || v[0] == '\0') {
+        return -1; // use device default
+    }
+
+    const int x = atoi(v);
+    if (x < 0) return 0;
+    return x;
+}
+
 static bool ggml_metal_env_is_mgpu_enabled_(void) {
     const char * v = getenv("GGML_METAL_DEVICE_INDEX");
     return v != NULL && strchr(v, ',') != NULL;
 }
 
+static int ggml_metal_env_mgpu_mul_mat_decode_min_bs_(void) {
+    const char * v = getenv("GGML_METAL_MGPU_MUL_MAT_DECODE_MIN_BS");
+    if (v == NULL || v[0] == '\0') {
+        return 16;
+    }
+    
+    const int x = atoi(v);
+    
+    // Clamp to a sane range:
+    // 0  => fully reopen MUL_MAT decode offload
+    // 1+ => keep a minimum batch-size guard
+    if (x < 0) return 0;
+    return x;
+}
 // initialized in ggml_backend_metal_reg
 static ggml_backend_reg g_ggml_metal_reg;
 
@@ -798,11 +952,32 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
     return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped_for_dev_(dev), ggml_backend_metal_buffer_mapped_i, res, size);
 }
 
-static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+        ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
-    return ggml_metal_device_supports_op(ctx_dev, op);
-}
+        if (op == NULL) {
+            ggml_metal_trace_op_decision_("supports_op", dev, op, -1, 0, "op-null");
+            return false;
+        }
+
+        const int64_t bs =
+            op->op == GGML_OP_MUL_MAT    ? op->ne[1] :
+            op->op == GGML_OP_MUL_MAT_ID ? op->ne[2] :
+            ggml_nrows(op);
+        
+        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_ADD_ID) {
+            ggml_metal_trace_op_decision_("supports_op-enter", dev, op, bs, 1, "enter");
+        }
+
+        const bool ok = ggml_metal_device_supports_op(ctx_dev, op);
+
+        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_ADD_ID) {
+            ggml_metal_trace_op_decision_("supports_op-exit", dev, op, bs, ok ? 1 : 0,
+                ok ? "device-supports-op-yes" : "device-supports-op-no");
+        }
+
+        return ok;
+    }
 
 static bool ggml_backend_metal_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     const bool is_metal_buft =
@@ -838,32 +1013,89 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
-    const bool is_mgpu = ggml_metal_env_is_mgpu_enabled_();
-    const int32_t bs = get_op_batch_size(op);
-   
-   // Temporary MGPU safety guard:
-   // decode-like MUL_MAT_ID is the first hot path observed to fail on Metal MGPU
-   // (Qwen3MoE / warmup / mul_mv_id path). Keep regular MUL_MAT offload enabled,
-   // but do not offload MUL_MAT_ID until the MGPU path is fully stabilized.
-   if (is_mgpu && op->op == GGML_OP_MUL_MAT_ID) {
-         return false;
-   }
-    if (op->op != GGML_OP_MUL_MAT) {
+    const bool    is_mgpu            = ggml_metal_env_is_mgpu_enabled_();
+    const int     mgpu_decode_min_bs = ggml_metal_env_mgpu_mul_mat_decode_min_bs_();
+    const int64_t bs                 = get_op_batch_size(op);
+    const bool    is_decode_like     = ggml_metal_op_is_decode_like_(op);
+    const int64_t offload_min_bs     = ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
+    int64_t       effective_offload_min_bs = offload_min_bs;
+    const int     small_mat_offload_max_bs = ggml_metal_env_mgpu_small_mat_offload_max_bs_();
+    bool          small_mat_override = false;    if (op == NULL) {
+        ggml_metal_log_offload_decision_(dev, op, -1, false, "op-null");
         return false;
     }
-    // MGPU decode safety guard:
-    // PP (large batch) is now stable, while TG/decode still fails.
-    // Keep Metal offload for large-batch prefill, but avoid Metal offload
-    // for tiny decode-like MUL_MAT batches in MGPU mode.
-    //
-    // Threshold 16 is intentionally conservative:
-    // - pp128 stays on Metal
-    // - token generation / very small batches fall back
-    if (is_mgpu && bs <= 16) {
+
+    // Limit this hook to matmul-like ops only.
+    if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
+        ggml_metal_log_offload_decision_(dev, op, bs, false, "unsupported-op-class");
         return false;
     }
-    return bs >= ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
+
+    // Single-GPU: preserve existing behavior for both MUL_MAT and MUL_MAT_ID.
+    if (!is_mgpu) {
+        const bool ok = bs >= offload_min_bs;
+        ggml_metal_log_offload_decision_(
+            dev, op, bs, ok,
+            ok ? "single-gpu-batch-ok" : "single-gpu-batch-too-small");
+        return ok;
     }
+
+    // MGPU policy:
+    // - reopen PP-only offload for MUL_MAT_ID
+    // - keep decode-like tiny-batch matmul/id on CPU for safety
+    if (is_decode_like && bs <= mgpu_decode_min_bs) {
+        ggml_metal_log_offload_decision_(dev, op, bs, false, "mgpu-decode-guard");
+        return false;
+    }
+    // MGPU decode override:
+    // allow small decode-like matmul paths to bypass the generic device threshold
+    // when explicitly requested by env. This is meant for TG/MoE investigation.
+    if (is_mgpu && is_decode_like &&
+        (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID)) {
+        const int env_decode_offload_min_bs = ggml_metal_env_mgpu_decode_offload_min_bs_();
+        if (env_decode_offload_min_bs >= 0) {
+            effective_offload_min_bs = env_decode_offload_min_bs;
+        }
+    }
+    // MGPU small-mat override:
+    // allow small TG/MoE matmul paths (e.g. bs=16) to bypass the generic device
+    // threshold even when they are not classified as decode-like.
+    if (is_mgpu &&
+        (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&
+        small_mat_offload_max_bs >= 0 &&
+        bs <= small_mat_offload_max_bs) {
+        const int env_decode_offload_min_bs = ggml_metal_env_mgpu_decode_offload_min_bs_();
+        if (env_decode_offload_min_bs >= 0) {
+            effective_offload_min_bs = env_decode_offload_min_bs;
+            small_mat_override = true;
+        }
+    }
+    
+    if (ggml_metal_env_offload_debug_()) {
+        fprintf(stderr,
+            "ggml-metal offload-threshold: dev='%s' op=%s tensor='%s' bs=%lld offload_min_bs=%lld effective_offload_min_bs=%lld is_mgpu=%d is_decode_like=%d small_mat_offload_max_bs=%d small_mat_override=%d\n",
+            ggml_backend_dev_description(dev),
+            ggml_metal_op_name_(op->op),
+            op->name[0] ? op->name : "(unnamed)",
+            (long long) bs,
+            (long long) offload_min_bs,
+            (long long) effective_offload_min_bs,
+            (int) is_mgpu,
+            (int) is_decode_like,
+            (int) small_mat_offload_max_bs,
+            (int) small_mat_override);
+    }
+    if (bs < effective_offload_min_bs) {
+        ggml_metal_log_offload_decision_(dev, op, bs, false, "device-offload-min-bs");
+        return false;
+    }
+
+    ggml_metal_log_offload_decision_(
+        dev, op, bs, true,
+        op->op == GGML_OP_MUL_MAT_ID ? "mgpu-pp-reopen-mul_mat_id" : "mgpu-batch-ok");
+
+    return true;
+}
 
 static ggml_backend_device_i ggml_backend_metal_device_i = {
     /* .get_name             = */ ggml_backend_metal_device_get_name,

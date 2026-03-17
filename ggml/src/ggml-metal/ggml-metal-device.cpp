@@ -14,9 +14,16 @@
 #include <mutex>
 
 
+
 // -----------------------------------------------------------------------------
 // Decode-only env helpers (must be visible before ggml_metal_library_get_pipeline_mul_mv)
 // Prefer env_decode if set, else fall back to env_global.
+// Extended policy:
+// - decode-like path: prefer DECODE_* then fallback to generic *
+// - non-decode / PP path: prefer PP_* then fallback to generic *
+//
+// This lets us tune PP and decode independently without breaking the existing
+// generic GGML_METAL_Q4K_* / GGML_METAL_Q6K_* behavior.
 static inline const char * ggml_metal_getenv_pref_(const char * env_decode, const char * env_global) {
     const char * v = getenv(env_decode);
     if (v && v[0]) {
@@ -29,6 +36,19 @@ static inline const char * ggml_metal_getenv_pref_(const char * env_decode, cons
     return NULL;
 }
 
+static inline const char * ggml_metal_getenv_phase_pref_(
+        bool is_decode_like,
+        const char * env_decode,
+        const char * env_pp,
+        const char * env_global) {
+    const char * v = NULL;
+    if (is_decode_like) {
+        v = ggml_metal_getenv_pref_(env_decode, env_global);
+    } else {
+        v = ggml_metal_getenv_pref_(env_pp, env_global);
+    }
+    return v;
+}
 // NR0 is compile-time in Metal kernels: only a discrete set exists.
 // Pick the greatest allowed NR0 <= max_nr0 (and >=2).
 static inline int ggml_metal_nr0_allowed_leq_(int max_nr0) {
@@ -819,15 +839,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
-                // Decode-preferred envs must affect BOTH Q4_K pipelines (mul_mv + mul_mv_id):
-                // - decode: prefer GGML_METAL_DECODE_Q4K_* then fallback to GGML_METAL_Q4K_*
-                // - non-decode: only GGML_METAL_Q4K_*
+                // Phase-aware overrides for Q4_K mul_mv:
+                // - decode-like: GGML_METAL_DECODE_Q4K_*
+                // - PP/non-decode: GGML_METAL_PP_Q4K_*
+                // - fallback: GGML_METAL_Q4K_*
                 const char * env_q4k_nsg =
-                is_decode_like ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q4K_NSG", "GGML_METAL_Q4K_NSG")
-                            : getenv("GGML_METAL_Q4K_NSG");
+                    ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                  "GGML_METAL_DECODE_Q4K_NSG",
+                                                  "GGML_METAL_PP_Q4K_NSG",
+                                                  "GGML_METAL_Q4K_NSG");
                 const char * env_q4k_nr0 =
-                is_decode_like ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q4K_NR0", "GGML_METAL_Q4K_NR0")
-                            : getenv("GGML_METAL_Q4K_NR0");
+                    ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                  "GGML_METAL_DECODE_Q4K_NR0",
+                                                  "GGML_METAL_PP_Q4K_NR0",
+                                                  "GGML_METAL_Q4K_NR0");
                 
                 if (env_q4k_nsg && env_q4k_nsg[0]) {
                     const int v = atoi(env_q4k_nsg);
@@ -872,11 +897,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q6_K;
                 nr0 = N_R0_Q6_K;
-                // Optional override: simdgroups per threadgroup for Q6_K mat-vec.
-                // Usage: export GGML_METAL_Q6K_NSG=4 (or GGML_METAL_DECODE_Q6K_NSG=4 for decode only)
+                // Phase-aware overrides for Q6_K mul_mv:
+                // - decode-like: GGML_METAL_DECODE_Q6K_*
+                // - PP/non-decode: GGML_METAL_PP_Q6K_*
+                // - fallback: GGML_METAL_Q6K_*
                 const char * env_q6k_nsg =
-                +is_decode_like ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q6K_NSG", "GGML_METAL_Q6K_NSG")
-                                   : getenv("GGML_METAL_Q6K_NSG");
+                    ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                  "GGML_METAL_DECODE_Q6K_NSG",
+                                                  "GGML_METAL_PP_Q6K_NSG",
+                                                  "GGML_METAL_Q6K_NSG");
                 if (env_q6k_nsg) {
                     const int v = atoi(env_q6k_nsg);
                     if (v >= 1 && v <= 8) {
@@ -887,10 +916,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // Optional override: rows per threadgroup for Q6_K mat-vec.
                 // NOTE: NR0 is compile-time in the Metal kernel. Only values that have a dedicated
                 // kernel entry point are allowed here.
-                // Usage: export GGML_METAL_Q6K_NR0=128
+                // Usage:
+                //   export GGML_METAL_PP_Q6K_NR0=128
+                //   export GGML_METAL_DECODE_Q6K_NR0=64
                 const char * env_q6k_nr0 =
-                is_decode_like ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q6K_NR0", "GGML_METAL_Q6K_NR0")
-                                    : getenv("GGML_METAL_Q6K_NR0");
+                    ggml_metal_getenv_phase_pref_(is_decode_like,
+                                                  "GGML_METAL_DECODE_Q6K_NR0",
+                                                  "GGML_METAL_PP_Q6K_NR0",
+                                                  "GGML_METAL_Q6K_NR0");
                  if (env_q6k_nr0) {
                    const int v = atoi(env_q6k_nr0);
                     if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
@@ -1020,20 +1053,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     if ((tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q6_K) && tsrc1 == GGML_TYPE_F32) {
         const char * dec_nsg = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_DECODE_Q4K_NSG") : getenv("GGML_METAL_DECODE_Q6K_NSG");
         const char * dec_nr0 = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_DECODE_Q4K_NR0") : getenv("GGML_METAL_DECODE_Q6K_NR0");
+        const char * pp_nsg  = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_PP_Q4K_NSG")     : getenv("GGML_METAL_PP_Q6K_NSG");
+        const char * pp_nr0  = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_PP_Q4K_NR0")     : getenv("GGML_METAL_PP_Q6K_NR0");
         const char * any_nsg = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_Q4K_NSG")        : getenv("GGML_METAL_Q6K_NSG");
         const char * any_nr0 = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_Q4K_NR0")        : getenv("GGML_METAL_Q6K_NR0");
         // Which envs were eligible for *this* call:
-        // decode-like => DECODE_* takes precedence, else only ANY_*.
-        const char * used_nsg = is_decode_like ? ((dec_nsg && dec_nsg[0]) ? dec_nsg : any_nsg) : any_nsg;
-        const char * used_nr0 = is_decode_like ? ((dec_nr0 && dec_nr0[0]) ? dec_nr0 : any_nr0) : any_nr0;
+        // decode-like => DECODE_* takes precedence, else PP_* takes precedence, then ANY_*.
+        const char * used_nsg = is_decode_like
+            ? ((dec_nsg && dec_nsg[0]) ? dec_nsg : any_nsg)
+            : ((pp_nsg  && pp_nsg [0]) ? pp_nsg  : any_nsg);
+        const char * used_nr0 = is_decode_like
+            ? ((dec_nr0 && dec_nr0[0]) ? dec_nr0 : any_nr0)
+            : ((pp_nr0  && pp_nr0 [0]) ? pp_nr0  : any_nr0);
         
-        GGML_LOG_DEBUG("%s: %s mul_mv select: is_decode=%d base='%s' name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
+        GGML_LOG_DEBUG("%s: %s mul_mv select: is_decode=%d base='%s' name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) pp(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
                        __func__,
                        tsrc0 == GGML_TYPE_Q4_K ? "Q4_K" : "Q6_K",
                        (int) is_decode_like, base, name,
                        res.nr0, res.nr1, res.nsg, res.smem,
                        used_nsg ? used_nsg : "", used_nr0 ? used_nr0 : "",
                        dec_nsg ? dec_nsg : "", dec_nr0 ? dec_nr0 : "",
+                       pp_nsg ? pp_nsg : "", pp_nr0 ? pp_nr0 : "",
                        any_nsg ? any_nsg : "", any_nr0 ? any_nr0 : "");
     }
     return res;
@@ -1109,20 +1149,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     const ggml_type tsrc1 = op->src[1]->type;
 
     const char * suffix = "";
-    // Decode-aware env overrides (prefer GGML_METAL_DECODE_* for decode-like mat-vec)
-    const char * env_q4k_nsg = is_decode_like
-        ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q4K_NSG", "GGML_METAL_Q4K_NSG")
-        : getenv("GGML_METAL_Q4K_NSG");
-    const char * env_q6k_nsg = is_decode_like
-        ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q6K_NSG", "GGML_METAL_Q6K_NSG")
-        : getenv("GGML_METAL_Q6K_NSG");
+
+    // Phase-aware env overrides for mul_mv_id:
+    // - decode-like: GGML_METAL_DECODE_Q*_ID_*
+    // - PP/non-decode: GGML_METAL_PP_Q*_ID_*
+    // - fallback: existing generic GGML_METAL_Q*_*
+    const char * env_q4k_nsg = ggml_metal_getenv_phase_pref_(is_decode_like,
+        "GGML_METAL_DECODE_Q4K_ID_NSG", "GGML_METAL_PP_Q4K_ID_NSG", "GGML_METAL_Q4K_NSG");
     
-    const char * env_q4k_nr0 = is_decode_like
-        ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q4K_NR0", "GGML_METAL_Q4K_NR0")
-        : getenv("GGML_METAL_Q4K_NR0");
-    const char * env_q6k_nr0 = is_decode_like
-        ? ggml_metal_getenv_pref_("GGML_METAL_DECODE_Q6K_NR0", "GGML_METAL_Q6K_NR0")
-        : getenv("GGML_METAL_Q6K_NR0");
+    const char * env_q6k_nsg = ggml_metal_getenv_phase_pref_(is_decode_like,
+        "GGML_METAL_DECODE_Q6K_ID_NSG", "GGML_METAL_PP_Q6K_ID_NSG", "GGML_METAL_Q6K_NSG");
+    
+    const char * env_q4k_nr0 = ggml_metal_getenv_phase_pref_(is_decode_like,
+        "GGML_METAL_DECODE_Q4K_ID_NR0", "GGML_METAL_PP_Q4K_ID_NR0", "GGML_METAL_Q4K_NR0");
+    
+    const char * env_q6k_nr0 = ggml_metal_getenv_phase_pref_(is_decode_like,
+        "GGML_METAL_DECODE_Q6K_ID_NR0", "GGML_METAL_PP_Q6K_ID_NR0", "GGML_METAL_Q6K_NR0");
     
     const bool has_q4k_nr0_env = (env_q4k_nr0 != NULL);
     const bool has_q6k_nr0_env = (env_q6k_nr0 != NULL);
@@ -1396,18 +1438,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     // Instrumentation: confirm Q4_K mul_mv_id uses the expected entry points and show which envs
     // were eligible for this call (decode-like => DECODE_* preferred, else only ANY_*).
     if (tsrc0 == GGML_TYPE_Q4_K && tsrc1 == GGML_TYPE_F32) {
-        const char * env_dec_nsg = getenv("GGML_METAL_DECODE_Q4K_NSG");
-        const char * env_dec_nr0 = getenv("GGML_METAL_DECODE_Q4K_NR0");
+        const char * env_dec_nsg = getenv("GGML_METAL_DECODE_Q4K_ID_NSG");
+        const char * env_dec_nr0 = getenv("GGML_METAL_DECODE_Q4K_ID_NR0");
+        const char * env_pp_nsg  = getenv("GGML_METAL_PP_Q4K_ID_NSG");
+        const char * env_pp_nr0  = getenv("GGML_METAL_PP_Q4K_ID_NR0");
         const char * env_any_nsg = getenv("GGML_METAL_Q4K_NSG");
         const char * env_any_nr0 = getenv("GGML_METAL_Q4K_NR0");
         
-        const char * used_nsg = is_decode_like ? ((env_dec_nsg && env_dec_nsg[0]) ? env_dec_nsg : env_any_nsg) : env_any_nsg;
-        const char * used_nr0 = is_decode_like ? ((env_dec_nr0 && env_dec_nr0[0]) ? env_dec_nr0 : env_any_nr0) : env_any_nr0;
+        const char * used_nsg = is_decode_like
+            ? ((env_dec_nsg && env_dec_nsg[0]) ? env_dec_nsg : env_any_nsg)
+            : ((env_pp_nsg  && env_pp_nsg [0]) ? env_pp_nsg  : env_any_nsg);
+        const char * used_nr0 = is_decode_like
+            ? ((env_dec_nr0 && env_dec_nr0[0]) ? env_dec_nr0 : env_any_nr0)
+            : ((env_pp_nr0  && env_pp_nr0 [0]) ? env_pp_nr0  : env_any_nr0);
         GGML_LOG_DEBUG(
-            "%s: Q4_K mul_mv_id select: is_decode=%d name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
+            "%s: Q4_K mul_mv_id select: is_decode=%d name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) pp(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
+
             __func__, (int) is_decode_like, name, res.nr0, res.nr1, res.nsg, res.smem,
             used_nsg ? used_nsg : "", used_nr0 ? used_nr0 : "",
             env_dec_nsg ? env_dec_nsg : "", env_dec_nr0 ? env_dec_nr0 : "",
+            env_pp_nsg ? env_pp_nsg : "", env_pp_nr0 ? env_pp_nr0 : "",
             env_any_nsg ? env_any_nsg : "", env_any_nr0 ? env_any_nr0 : "");
     }
      

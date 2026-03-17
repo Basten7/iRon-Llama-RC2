@@ -41,8 +41,15 @@ llama_kv_cache::llama_kv_cache(
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
-        }
+            const int cmp = strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs));
+            if (cmp != 0) {
+                return cmp < 0;
+            }
+            
+            // Important for MGPU: multiple backend buffer types can share the same
+            // user-visible name (e.g. "Metal_Private") while referring to different
+            // devices. Fall back to pointer identity to keep them distinct in the map.
+            return lhs < rhs;        }
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
