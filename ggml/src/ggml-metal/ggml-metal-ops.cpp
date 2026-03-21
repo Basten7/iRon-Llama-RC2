@@ -3,10 +3,18 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-metal-impl.h"
+#include "ggml-metal-common.h"
+#include "ggml-metal-device.h"
 #include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <strings.h>
+#include <atomic>
+#include <cassert>
+#include <algorithm>
+#include <limits>
+#include <cmath>
 
 // DIAG op support (needed by RPC graphs)
 static int ggml_metal_op_diag(ggml_metal_op_t ctx, int idx);
@@ -56,7 +64,117 @@ static bool ggml_metal_fa_log_enabled(void) {
     if (cached == -2) cached = ggml_metal_env_tri("GGML_METAL_FA_LOG", 0);
     return cached == 1;
 }
+//TOTO
+static bool ggml_metal_mmv_log_enabled(void) {
+    static int cached = -2;
+    if (cached == -2) cached = ggml_metal_env_tri("GGML_METAL_MMV_LOG", 0);
+    return cached == 1;
+}
 
+struct ggml_metal_decode_shape_class_ops_ {
+    bool    is_decode_like;
+    bool    is_decode_strict;
+    bool    is_decode_small_mat;
+    bool    is_pp_small_batch;
+    int64_t bs;
+    int64_t aux_batch;
+};
+
+static ggml_metal_decode_shape_class_ops_ ggml_metal_classify_decode_shape_ops_(const ggml_tensor * op) {
+    ggml_metal_decode_shape_class_ops_ cls = {
+        /* .is_decode_like      = */ false,
+        /* .is_decode_strict    = */ false,
+        /* .is_decode_small_mat = */ false,
+        /* .is_pp_small_batch   = */ false,
+        /* .bs                  = */ 0,
+        /* .aux_batch           = */ 1,
+    };
+
+    if (op == NULL) {
+        return cls;
+    }
+
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            cls.bs = op->ne[1];
+            cls.aux_batch = (int64_t) op->ne[2] * (int64_t) op->ne[3];
+            cls.is_decode_like      = (op->ne[1] <= 1);
+            cls.is_decode_strict    = (op->ne[1] == 1 && op->ne[2] == 1 && op->ne[3] == 1);
+            cls.is_decode_small_mat = (op->ne[1] == 1 && cls.aux_batch > 1 && cls.aux_batch <= 8);
+            cls.is_pp_small_batch   = (op->ne[1] > 1 && op->ne[1] <= 8);
+            break;
+
+        case GGML_OP_MUL_MAT_ID:
+            cls.bs = op->ne[2];
+            cls.aux_batch = (int64_t) op->ne[2] * (int64_t) op->ne[3];
+            cls.is_decode_like      = (op->ne[2] <= 1);
+            cls.is_decode_strict    = (op->ne[2] == 1 && op->ne[3] == 1);
+            cls.is_decode_small_mat = (op->ne[2] == 1 && op->ne[3] > 1 && op->ne[3] <= 8);
+            cls.is_pp_small_batch   = (op->ne[2] > 1 && op->ne[2] <= 8);
+            break;
+
+        default:
+            break;
+    }
+
+    return cls;
+}
+
+static int ggml_metal_env_mmv_dec_nr0(void) {
+    static int cached = INT_MIN;
+    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_MMV_DEC_NR0", 0);
+    return cached;
+}
+
+static int ggml_metal_env_mmv_dec_nsg(void) {
+    static int cached = INT_MIN;
+    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_MMV_DEC_NSG", 0);
+    return cached;
+}
+
+static int ggml_metal_env_mmv_id_dec_nr0(void) {
+    static int cached = INT_MIN;
+    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_MMV_ID_DEC_NR0", 0);
+    return cached;
+}
+
+static int ggml_metal_env_mmv_id_dec_nsg(void) {
+    static int cached = INT_MIN;
+    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_MMV_ID_DEC_NSG", 0);
+    return cached;
+}
+
+static void ggml_metal_log_mmv_select_(
+        const char * fn,
+        const ggml_tensor * op,
+        const ggml_metal_decode_shape_class_ops_ & cls,
+        int nr0,
+        int nr1,
+        int nsg,
+        size_t smem,
+        const char * reason) {
+    if (!ggml_metal_mmv_log_enabled()) {
+        return;
+    }
+
+    fprintf(stderr,
+        "ggml-metal %s: op=%s tensor='%s' type=%s bs=%lld aux_batch=%lld decode_like=%d decode_strict=%d decode_small_mat=%d pp_small_batch=%d nr0=%d nr1=%d nsg=%d smem=%zu reason=%s\n",
+        fn,
+        ggml_op_name(op->op),
+        op->name[0] ? op->name : "(unnamed)",
+        ggml_type_name(op->src[0]->type),
+        (long long) cls.bs,
+        (long long) cls.aux_batch,
+        (int) cls.is_decode_like,
+        (int) cls.is_decode_strict,
+        (int) cls.is_decode_small_mat,
+        (int) cls.is_pp_small_batch,
+        nr0,
+        nr1,
+        nsg,
+        smem,
+        reason ? reason : "none");
+}
 #include "ggml-metal-impl.h"
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
@@ -1797,6 +1915,7 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
 
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+    const ggml_metal_decode_shape_class_ops_ cls = ggml_metal_classify_decode_shape_ops_(op);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -1969,12 +2088,32 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
 
-        const int nr0 = pipeline.nr0;
+        int nr0 = pipeline.nr0;
         const int nr1 = pipeline.nr1;
-        const int nsg = pipeline.nsg;
+        int nsg = pipeline.nsg;
 
         const size_t smem = pipeline.smem;
-
+        
+        const bool use_dec_override = cls.is_decode_strict || cls.is_decode_small_mat;
+        if (use_dec_override) {
+            const int env_nr0 = ggml_metal_env_mmv_dec_nr0();
+            const int env_nsg = ggml_metal_env_mmv_dec_nsg();
+            if (env_nr0 > 0) nr0 = env_nr0;
+            if (env_nsg > 0) nsg = env_nsg;
+        }
+        
+        ggml_metal_log_mmv_select_(
+            "mul_mv",
+            op,
+            cls,
+            nr0,
+            nr1,
+            nsg,
+            smem,
+            use_dec_override
+                ? (cls.is_decode_strict ? "decode-strict-override" : "decode-small-mat-override")
+                : "pipeline-default");
+        
         ggml_metal_kargs_mul_mv args = {
             /*.ne00 =*/ ne00,
             /*.ne01 =*/ ne01,
@@ -2037,6 +2176,7 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
 
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+    const ggml_metal_decode_shape_class_ops_ cls = ggml_metal_classify_decode_shape_ops_(op);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -2163,14 +2303,65 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
         }
     } else {
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
+//        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op); // TOTO FASToverdie de ggml_metal_pipeline_with_params
+//        //ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op) à trouver dans autre fichier
+//
+//        int nr0 = pipeline.nr0;
+//        const int nr1 = pipeline.nr1;
+//        int nsg = pipeline.nsg;
+//
+//        const size_t smem = pipeline.smem;
+//        const bool is_q4k_decode = (
+//            op->src[0]->type == GGML_TYPE_Q4_K &&
+//            (cls.is_decode_strict || cls.is_decode_small_mat)
+//        );
+//        
+//        const bool use_dec_override = cls.is_decode_strict || cls.is_decode_small_mat;
+//        
+//        if (is_q4k_decode) {
+//            // Native decode preference validated on Q4_K MoE decode:
+//            // MUL_MAT_ID + decode(strict|small-mat) -> NR0=8, NSG=2
+//            nr0 = 8;
+//            nsg = 2;
+//        } else if (use_dec_override) {
+//            const int env_nr0 = ggml_metal_env_mmv_id_dec_nr0();
+//            const int env_nsg = ggml_metal_env_mmv_id_dec_nsg();
+//            if (env_nr0 > 0) nr0 = env_nr0;
+//            if (env_nsg > 0) nsg = env_nsg;
+//        }
+//        
+//        ggml_metal_log_mmv_select_(
+//            "mul_mv_id",
+//            op,
+//            cls,
+//            nr0,
+//            nr1,
+//            nsg,
+//            smem,
+//            is_q4k_decode
+//                ? (cls.is_decode_strict ? "q4k-native-decode-strict-8x2" : "q4k-native-decode-small-mat-8x2")
+//                : use_dec_override
+//                    ? (cls.is_decode_strict ? "decode-strict-override" : "decode-small-mat-override")
+//                    : "pipeline-default");
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op); // TOTO SLOW overdie de ggml_metal_pipeline_with_params
+        //ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op) à trouver dans autre fichier
 
         const int nr0 = pipeline.nr0;
         const int nr1 = pipeline.nr1;
         const int nsg = pipeline.nsg;
 
         const size_t smem = pipeline.smem;
-
+        
+        ggml_metal_log_mmv_select_(
+            "mul_mv_id",
+            op,
+            cls,
+            nr0,
+            nr1,
+            nsg,
+            smem,
+            "pipeline-default");
+        
         ggml_metal_kargs_mul_mv_id args = {
             /*.nei0 =*/ ne20,
             /*.nei1 =*/ ne21,

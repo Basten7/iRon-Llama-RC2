@@ -1124,16 +1124,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     return res;
 }
 
+static bool ggml_metal_nr0_is_allowed_id_test_(int v) {
+    return v == 2 || v == 4 || v == 8 || v == 10 || v == 12;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op) {
-    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
-    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(int32_t, ne1, op->src[1], ne);
+
     const bool is_decode_strict = (ne11 == 1 && ne12 == 1 && ne13 == 1);
-    const int64_t aux_batch      = (int64_t) ne12 * (int64_t) ne13;
-    const bool is_decode_like    = (ne11 == 1 && aux_batch <= 8);
+    const int64_t aux_batch     = (int64_t) ne12 * (int64_t) ne13;
+    const bool is_decode_like   = (ne11 == 1 && aux_batch <= 8);
+
     // NOTE:
     // MUL_MAT_ID is on the MoE hot path for Qwen3MoE. We must support the same NR0/NSG overrides
     // as MUL_MV (non-ID), but selecting kernel_mul_mv_id_* entry points.
- 
+
     // The ID mat-vec kernel is specialized by NR0 at compile-time (Metal template parameter).
     // Only values with dedicated host_name entry points are allowed.
     char base[256];
@@ -1150,140 +1156,167 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
 
     const char * suffix = "";
 
+    auto nr0_allowed_id = [](int v) -> bool {
+        return v == 2 || v == 4 || v == 8 || v == 10 || v == 12;
+    };
+
+    auto nr0_allowed_id_leq = [&](int v_req) -> int {
+        static const int allowed[] = { 12, 10, 8, 4, 2 };
+        for (int v : allowed) {
+            if (v <= v_req) {
+                return v;
+            }
+        }
+        return 2;
+    };
+
     // Phase-aware env overrides for mul_mv_id:
     // - decode-like: GGML_METAL_DECODE_Q*_ID_*
     // - PP/non-decode: GGML_METAL_PP_Q*_ID_*
     // - fallback: existing generic GGML_METAL_Q*_*
-    const char * env_q4k_nsg = ggml_metal_getenv_phase_pref_(is_decode_like,
-        "GGML_METAL_DECODE_Q4K_ID_NSG", "GGML_METAL_PP_Q4K_ID_NSG", "GGML_METAL_Q4K_NSG");
-    
-    const char * env_q6k_nsg = ggml_metal_getenv_phase_pref_(is_decode_like,
-        "GGML_METAL_DECODE_Q6K_ID_NSG", "GGML_METAL_PP_Q6K_ID_NSG", "GGML_METAL_Q6K_NSG");
-    
-    const char * env_q4k_nr0 = ggml_metal_getenv_phase_pref_(is_decode_like,
-        "GGML_METAL_DECODE_Q4K_ID_NR0", "GGML_METAL_PP_Q4K_ID_NR0", "GGML_METAL_Q4K_NR0");
-    
-    const char * env_q6k_nr0 = ggml_metal_getenv_phase_pref_(is_decode_like,
-        "GGML_METAL_DECODE_Q6K_ID_NR0", "GGML_METAL_PP_Q6K_ID_NR0", "GGML_METAL_Q6K_NR0");
-    
-    const bool has_q4k_nr0_env = (env_q4k_nr0 != NULL);
-    const bool has_q6k_nr0_env = (env_q6k_nr0 != NULL);
+    const char * env_q4k_nsg = ggml_metal_getenv_phase_pref_(
+        is_decode_like,
+        "GGML_METAL_DECODE_Q4K_ID_NSG",
+        "GGML_METAL_PP_Q4K_ID_NSG",
+        "GGML_METAL_Q4K_NSG");
+
+    const char * env_q6k_nsg = ggml_metal_getenv_phase_pref_(
+        is_decode_like,
+        "GGML_METAL_DECODE_Q6K_ID_NSG",
+        "GGML_METAL_PP_Q6K_ID_NSG",
+        "GGML_METAL_Q6K_NSG");
+
+    const char * env_q4k_nr0 = ggml_metal_getenv_phase_pref_(
+        is_decode_like,
+        "GGML_METAL_DECODE_Q4K_ID_NR0",
+        "GGML_METAL_PP_Q4K_ID_NR0",
+        "GGML_METAL_Q4K_NR0");
+
+    const char * env_q6k_nr0 = ggml_metal_getenv_phase_pref_(
+        is_decode_like,
+        "GGML_METAL_DECODE_Q6K_ID_NR0",
+        "GGML_METAL_PP_Q6K_ID_NR0",
+        "GGML_METAL_Q6K_NR0");
+
+    const bool has_q4k_nr0_env = (env_q4k_nr0 != NULL && env_q4k_nr0[0] != '\0');
+    const bool has_q6k_nr0_env = (env_q6k_nr0 != NULL && env_q6k_nr0[0] != '\0');
+
     static bool s_logged_decode_like_id = false;
     if (!s_logged_decode_like_id && is_decode_like && !is_decode_strict) {
-         s_logged_decode_like_id = true;
-         GGML_LOG_INFO("%s: decode-like mul_mv_id detected (ne11=%d ne12=%d ne13=%d); DECODE_* envs may apply\n", __func__, (int) ne11, (int) ne12, (int) ne13);
+        s_logged_decode_like_id = true;
+        GGML_LOG_INFO(
+            "%s: decode-like mul_mv_id detected (ne11=%d ne12=%d ne13=%d); DECODE_* envs may apply\n",
+            __func__, (int) ne11, (int) ne12, (int) ne13);
     }
-    
-        // use custom matrix x vector kernel
+
+    // use custom matrix x vector kernel
     switch (tsrc0) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
-        case GGML_TYPE_BF16:
-            {
-                nsg = std::min(4, (ne00 + 127) / 128);
-                nr0 = 2;
-                nr1 = 1;
-                smem = 32*sizeof(float)*nr0;
-                suffix = ne00 % 4 == 0 ? "_4" : "";
-                
-                // Optional override: rows per threadgroup for F32/F16 mat-vec (non-short path).
-                // This maps to args.nr0 consumed by the Metal kernel dispatch switch.
-                // Usage:
-                //   export GGML_METAL_F32_NR0=8
-                //   export GGML_METAL_F16_NR0=8
-                if (strcmp(suffix, "_short") != 0) {
-                    const bool is_f32 = (tsrc0 == GGML_TYPE_F32);
-                    const bool is_f16 = (tsrc0 == GGML_TYPE_F16);
-                    const char * env = is_f32 ? getenv("GGML_METAL_F32_NR0")
-                                     : is_f16 ? getenv("GGML_METAL_F16_NR0")
-                              : NULL;
-                    if (env) {
-                                        const int v = atoi(env);
-                        // Supported NR0 values are those compiled into the Metal dispatch switch.
-                        if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16 || v == 32) {
-                            nr0  = v;
-                            smem = 32*sizeof(float)*nr0;
-                        }
-                        static bool s_logged_f32 = false;
-                        static bool s_logged_f16 = false;
-                        bool & s_logged = is_f32 ? s_logged_f32 : s_logged_f16;
-                        if (!s_logged) {
-                            s_logged = true;
-                            GGML_LOG_INFO("%s: %s NR0 override = %d\n",
-                                          __func__, is_f32 ? "F32" : "F16", (int) nr0);
-                        }
+        case GGML_TYPE_BF16: {
+            nsg = std::min(4, (ne00 + 127) / 128);
+            nr0 = 2;
+            nr1 = 1;
+            smem = 32*sizeof(float)*nr0;
+            suffix = ne00 % 4 == 0 ? "_4" : "";
+
+            // Optional override: rows per threadgroup for F32/F16 mat-vec (non-short path).
+            if (strcmp(suffix, "_short") != 0) {
+                const bool is_f32 = (tsrc0 == GGML_TYPE_F32);
+                const bool is_f16 = (tsrc0 == GGML_TYPE_F16);
+                const char * env = is_f32 ? getenv("GGML_METAL_F32_NR0")
+                                  : is_f16 ? getenv("GGML_METAL_F16_NR0")
+                                           : NULL;
+                if (env) {
+                    const int v = atoi(env);
+                    if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16 || v == 32) {
+                        nr0  = v;
+                        smem = 32*sizeof(float)*nr0;
+                    }
+                    static bool s_logged_f32 = false;
+                    static bool s_logged_f16 = false;
+                    bool & s_logged = is_f32 ? s_logged_f32 : s_logged_f16;
+                    if (!s_logged) {
+                        s_logged = true;
+                        GGML_LOG_INFO("%s: %s NR0 override = %d\n",
+                                      __func__, is_f32 ? "F32" : "F16", (int) nr0);
                     }
                 }
-            } break;
-        case GGML_TYPE_Q4_0:
-            {
-                nsg = N_SG_Q4_0;
-                nr0 = N_R0_Q4_0;
-            } break;
-        case GGML_TYPE_Q4_1:
-            {
-                nsg = N_SG_Q4_1;
-                nr0 = N_R0_Q4_1;
-            } break;
-        case GGML_TYPE_Q5_0:
-            {
-                nsg = N_SG_Q5_0;
-                nr0 = N_R0_Q5_0;
-            } break;
-        case GGML_TYPE_Q5_1:
-            {
-                nsg = N_SG_Q5_1;
-                nr0 = N_R0_Q5_1;
-            } break;
-        case GGML_TYPE_Q8_0:
-            {
-                nsg = N_SG_Q8_0;
-                nr0 = N_R0_Q8_0;
-                smem = 32*sizeof(float)*N_R0_Q8_0;
-            } break;
-        case GGML_TYPE_MXFP4:
-            {
-                nsg = N_SG_MXFP4;
-                nr0 = N_R0_MXFP4;
-                smem = 32*sizeof(float);
-            } break;
-        case GGML_TYPE_Q2_K:
-            {
-                nsg = N_SG_Q2_K;
-                nr0 = N_R0_Q2_K;
-            } break;
-        case GGML_TYPE_Q3_K:
-            {
-                nsg = N_SG_Q3_K;
-                nr0 = N_R0_Q3_K;
-            } break;
+            }
+        } break;
+
+        case GGML_TYPE_Q4_0: {
+            nsg = N_SG_Q4_0;
+            nr0 = N_R0_Q4_0;
+        } break;
+
+        case GGML_TYPE_Q4_1: {
+            nsg = N_SG_Q4_1;
+            nr0 = N_R0_Q4_1;
+        } break;
+
+        case GGML_TYPE_Q5_0: {
+            nsg = N_SG_Q5_0;
+            nr0 = N_R0_Q5_0;
+        } break;
+
+        case GGML_TYPE_Q5_1: {
+            nsg = N_SG_Q5_1;
+            nr0 = N_R0_Q5_1;
+        } break;
+
+        case GGML_TYPE_Q8_0: {
+            nsg = N_SG_Q8_0;
+            nr0 = N_R0_Q8_0;
+            smem = 32*sizeof(float)*N_R0_Q8_0;
+        } break;
+
+        case GGML_TYPE_MXFP4: {
+            nsg = N_SG_MXFP4;
+            nr0 = N_R0_MXFP4;
+            smem = 32*sizeof(float);
+        } break;
+
+        case GGML_TYPE_Q2_K: {
+            nsg = N_SG_Q2_K;
+            nr0 = N_R0_Q2_K;
+        } break;
+
+        case GGML_TYPE_Q3_K: {
+            nsg = N_SG_Q3_K;
+            nr0 = N_R0_Q3_K;
+        } break;
+
         case GGML_TYPE_Q4_K: {
             nsg = N_SG_Q4_K;
             nr0 = N_R0_Q4_K;
-            
+
             if (env_q4k_nsg && env_q4k_nsg[0]) {
                 const int v = atoi(env_q4k_nsg);
                 if (v >= 1 && v <= 8) {
                     nsg = v;
                 }
             }
-            
+
             if (env_q4k_nr0 && env_q4k_nr0[0]) {
-               const int v_req = atoi(env_q4k_nr0);
-              // Only values with dedicated entry points should be selected.
-            // If the user asks something else, clamp down to the nearest allowed <= request.
-                const int v = ggml_metal_nr0_allowed_leq_(v_req);
-                if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+                const int v_req = atoi(env_q4k_nr0);
+                const int v = nr0_allowed_id_leq(v_req);
+                if (nr0_allowed_id(v)) {
                     nr0 = v;
                 }
             }
+
             // Safety clamp: avoid invalid (ne00 < nsg*nr0) combos.
-            if (nsg < 1) nsg = 1;
-            if (nr0 < 2) nr0 = 2;
-            
+            if (nsg < 1) {
+                nsg = 1;
+            }
+            if (nr0 < 2) {
+                nr0 = 2;
+            }
+
             const int max_nr0 = (int) (ne00 / nsg);
             if (max_nr0 >= 2) {
-                const int nr0_clamped = ggml_metal_nr0_allowed_leq_(max_nr0);
+                const int nr0_clamped = nr0_allowed_id_leq(max_nr0);
                 if (nr0 > nr0_clamped) {
                     nr0 = nr0_clamped;
                 }
@@ -1291,126 +1324,123 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nsg = 1;
                 nr0 = 2;
             }
-                    } break;
-            
-        case GGML_TYPE_Q5_K:
-            {
-                nsg = N_SG_Q5_K;
-                nr0 = N_R0_Q5_K;
-            } break;
-        case GGML_TYPE_Q6_K:
-            {
-                nsg = N_SG_Q6_K;
-                nr0 = N_R0_Q6_K;
-                if (env_q6k_nsg) {
-                    const int v = atoi(env_q6k_nsg);
-                    if (v >= 1 && v <= 8) {
-                        nsg = v;
-                    }
-                }
+        } break;
 
-                if (env_q6k_nr0) {
-                    const int v = atoi(env_q6k_nr0);
-                    if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
-                        nr0 = v;
-                    }
+        case GGML_TYPE_Q5_K: {
+            nsg = N_SG_Q5_K;
+            nr0 = N_R0_Q5_K;
+        } break;
+
+        case GGML_TYPE_Q6_K: {
+            nsg = N_SG_Q6_K;
+            nr0 = N_R0_Q6_K;
+
+            if (env_q6k_nsg && env_q6k_nsg[0]) {
+                const int v = atoi(env_q6k_nsg);
+                if (v >= 1 && v <= 8) {
+                    nsg = v;
                 }
-            } break;
-        case GGML_TYPE_IQ2_XXS:
-            
-            {
-                nsg = N_SG_IQ2_XXS;
-                nr0 = N_R0_IQ2_XXS;
-                smem = 256*8+128;
-            } break;
-        case GGML_TYPE_IQ2_XS:
-            {
-                nsg = N_SG_IQ2_XS;
-                nr0 = N_R0_IQ2_XS;
-                smem = 512*8+128;
-            } break;
-        case GGML_TYPE_IQ3_XXS:
-            {
-                nsg = N_SG_IQ3_XXS;
-                nr0 = N_R0_IQ3_XXS;
-                smem = 256*4+128;
-            } break;
-        case GGML_TYPE_IQ3_S:
-            {
-                nsg = N_SG_IQ3_S;
-                nr0 = N_R0_IQ3_S;
-                smem = 512*4;
-            } break;
-        case GGML_TYPE_IQ2_S:
-            {
-                nsg = N_SG_IQ2_S;
-                nr0 = N_R0_IQ2_S;
-            } break;
-        case GGML_TYPE_IQ1_S:
-            {
-                nsg = N_SG_IQ1_S;
-                nr0 = N_R0_IQ1_S;
-            } break;
-        case GGML_TYPE_IQ1_M:
-            {
-                nsg = N_SG_IQ1_M;
-                nr0 = N_R0_IQ1_M;
-            } break;
-        case GGML_TYPE_IQ4_NL:
-            {
-                nsg = N_SG_IQ4_NL;
-                nr0 = N_R0_IQ4_NL;
-                smem = 32*sizeof(float);
-            } break;
-        case GGML_TYPE_IQ4_XS:
-            {
-                nsg = N_SG_IQ4_XS;
-                nr0 = N_R0_IQ4_XS;
-                smem = 32*sizeof(float);
-            } break;
-        default:
-            {
-                GGML_LOG_ERROR("Asserting on type %d\n", (int)tsrc0);
-                GGML_ABORT("not implemented");
             }
+
+            if (env_q6k_nr0 && env_q6k_nr0[0]) {
+                const int v_req = atoi(env_q6k_nr0);
+                const int v = nr0_allowed_id_leq(v_req);
+                if (nr0_allowed_id(v)) {
+                    nr0 = v;
+                }
+            }
+
+            if (nsg < 1) {
+                nsg = 1;
+            }
+            if (nr0 < 2) {
+                nr0 = 2;
+            }
+
+            const int max_nr0 = (int) (ne00 / nsg);
+            if (max_nr0 >= 2) {
+                const int nr0_clamped = nr0_allowed_id_leq(max_nr0);
+                if (nr0 > nr0_clamped) {
+                    nr0 = nr0_clamped;
+                }
+            } else {
+                nsg = 1;
+                nr0 = 2;
+            }
+        } break;
+
+        case GGML_TYPE_IQ2_XXS: {
+            nsg = N_SG_IQ2_XXS;
+            nr0 = N_R0_IQ2_XXS;
+            smem = 256*8+128;
+        } break;
+
+        case GGML_TYPE_IQ2_XS: {
+            nsg = N_SG_IQ2_XS;
+            nr0 = N_R0_IQ2_XS;
+            smem = 512*8+128;
+        } break;
+
+        case GGML_TYPE_IQ3_XXS: {
+            nsg = N_SG_IQ3_XXS;
+            nr0 = N_R0_IQ3_XXS;
+            smem = 256*4+128;
+        } break;
+
+        case GGML_TYPE_IQ3_S: {
+            nsg = N_SG_IQ3_S;
+            nr0 = N_R0_IQ3_S;
+            smem = 512*4;
+        } break;
+
+        case GGML_TYPE_IQ2_S: {
+            nsg = N_SG_IQ2_S;
+            nr0 = N_R0_IQ2_S;
+        } break;
+
+        case GGML_TYPE_IQ1_S: {
+            nsg = N_SG_IQ1_S;
+            nr0 = N_R0_IQ1_S;
+        } break;
+
+        case GGML_TYPE_IQ1_M: {
+            nsg = N_SG_IQ1_M;
+            nr0 = N_R0_IQ1_M;
+        } break;
+
+        case GGML_TYPE_IQ4_NL: {
+            nsg = N_SG_IQ4_NL;
+            nr0 = N_R0_IQ4_NL;
+            smem = 32*sizeof(float);
+        } break;
+
+        case GGML_TYPE_IQ4_XS: {
+            nsg = N_SG_IQ4_XS;
+            nr0 = N_R0_IQ4_XS;
+            smem = 32*sizeof(float);
+        } break;
+
+        default: {
+            GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
+            GGML_ABORT("not implemented");
+        }
     };
 
     // Q4_K/Q6_K NR0 is compile-time in the Metal kernel. If the user overrides NR0, the host must select
     // a matching kernel entry point (specialized by NR0) to avoid correctness issues.
-    if (tsrc0 == GGML_TYPE_Q4_K && has_q4k_nr0_env && nr0 != N_R0_Q4_K) {
-        // NR0 is a compile-time specialization. If the user requests an unsupported value,
-        // clamp it to the nearest supported value <= requested (see ggml_metal_nr0_allowed_leq_()).
-        const int v_req = nr0;
-        const int v     = ggml_metal_nr0_allowed_leq_(v_req);
-    
-        nr0 = v;
-    
-        if (nr0 != N_R0_Q4_K) {
-            snprintf(base, 256, "kernel_mul_mv_id_%s_%s_nr0_%d%s",
-                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), nr0, suffix);
-        } else {
-            snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s",
-                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-        }
-    } else if (tsrc0 == GGML_TYPE_Q6_K && has_q6k_nr0_env && nr0 != N_R0_Q6_K) {
-        const int v = nr0;
-        if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
-            snprintf(base, 256, "kernel_mul_mv_id_%s_%s_nr0_%d%s",
-                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), v, suffix);
-        } else {
-            // Unsupported override -> fall back to the default kernel and reset nr0 to the compiled default.
-            nr0 = N_R0_Q6_K;
-            snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s",
-                     ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-        }
+    if (tsrc0 == GGML_TYPE_Q4_K && nr0 != N_R0_Q4_K) {
+        snprintf(base, sizeof(base), "kernel_mul_mv_id_%s_%s_nr0_%d%s",
+                 ggml_type_name(tsrc0), ggml_type_name(tsrc1), nr0, suffix);
+    } else if (tsrc0 == GGML_TYPE_Q6_K && nr0 != N_R0_Q6_K) {
+        snprintf(base, sizeof(base), "kernel_mul_mv_id_%s_%s_nr0_%d%s",
+                 ggml_type_name(tsrc0), ggml_type_name(tsrc1), nr0, suffix);
     } else {
-        snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s",
+        snprintf(base, sizeof(base), "kernel_mul_mv_id_%s_%s%s",
                  ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
     }
 
-    snprintf(name, 256, "%s_nsg=%d", base, nsg);
-    // Instrumentation (decode focus): confirm which Q4_K specialization is actually selected.
-    // Enable with -lv 4 (GGML_LOG_DEBUG).
+    snprintf(name, sizeof(name), "%s_nsg=%d", base, nsg);
+
     if (tsrc0 == GGML_TYPE_Q4_K) {
         GGML_LOG_DEBUG(
             "%s: Q4_K mul_mv_id select: base='%s' name='%s' -> nr0=%d nsg=%d (env_nsg='%s' env_nr0='%s' has_nr0_env=%d)\n",
@@ -1419,7 +1449,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             env_q4k_nr0 ? env_q4k_nr0 : "",
             (int) has_q4k_nr0_env);
     }
-    
+
+    if (tsrc0 == GGML_TYPE_Q6_K) {
+        GGML_LOG_DEBUG(
+            "%s: Q6_K mul_mv_id select: base='%s' name='%s' -> nr0=%d nsg=%d (env_nsg='%s' env_nr0='%s' has_nr0_env=%d)\n",
+            __func__, base, name, nr0, nsg,
+            env_q6k_nsg ? env_q6k_nsg : "",
+            env_q6k_nr0 ? env_q6k_nr0 : "",
+            (int) has_q6k_nr0_env);
+    }
+
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
@@ -1435,8 +1474,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     res.nr1  = nr1;
     res.nsg  = nsg;
     res.smem = smem;
-    // Instrumentation: confirm Q4_K mul_mv_id uses the expected entry points and show which envs
-    // were eligible for this call (decode-like => DECODE_* preferred, else only ANY_*).
+
     if (tsrc0 == GGML_TYPE_Q4_K && tsrc1 == GGML_TYPE_F32) {
         const char * env_dec_nsg = getenv("GGML_METAL_DECODE_Q4K_ID_NSG");
         const char * env_dec_nr0 = getenv("GGML_METAL_DECODE_Q4K_ID_NR0");
@@ -1444,23 +1482,47 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         const char * env_pp_nr0  = getenv("GGML_METAL_PP_Q4K_ID_NR0");
         const char * env_any_nsg = getenv("GGML_METAL_Q4K_NSG");
         const char * env_any_nr0 = getenv("GGML_METAL_Q4K_NR0");
-        
+
         const char * used_nsg = is_decode_like
             ? ((env_dec_nsg && env_dec_nsg[0]) ? env_dec_nsg : env_any_nsg)
-            : ((env_pp_nsg  && env_pp_nsg [0]) ? env_pp_nsg  : env_any_nsg);
+            : ((env_pp_nsg  && env_pp_nsg[0])  ? env_pp_nsg  : env_any_nsg);
         const char * used_nr0 = is_decode_like
             ? ((env_dec_nr0 && env_dec_nr0[0]) ? env_dec_nr0 : env_any_nr0)
-            : ((env_pp_nr0  && env_pp_nr0 [0]) ? env_pp_nr0  : env_any_nr0);
+            : ((env_pp_nr0  && env_pp_nr0[0])  ? env_pp_nr0  : env_any_nr0);
+
         GGML_LOG_DEBUG(
             "%s: Q4_K mul_mv_id select: is_decode=%d name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) pp(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
-
             __func__, (int) is_decode_like, name, res.nr0, res.nr1, res.nsg, res.smem,
             used_nsg ? used_nsg : "", used_nr0 ? used_nr0 : "",
             env_dec_nsg ? env_dec_nsg : "", env_dec_nr0 ? env_dec_nr0 : "",
             env_pp_nsg ? env_pp_nsg : "", env_pp_nr0 ? env_pp_nr0 : "",
             env_any_nsg ? env_any_nsg : "", env_any_nr0 ? env_any_nr0 : "");
     }
-     
+
+    if (tsrc0 == GGML_TYPE_Q6_K && tsrc1 == GGML_TYPE_F32) {
+        const char * env_dec_nsg = getenv("GGML_METAL_DECODE_Q6K_ID_NSG");
+        const char * env_dec_nr0 = getenv("GGML_METAL_DECODE_Q6K_ID_NR0");
+        const char * env_pp_nsg  = getenv("GGML_METAL_PP_Q6K_ID_NSG");
+        const char * env_pp_nr0  = getenv("GGML_METAL_PP_Q6K_ID_NR0");
+        const char * env_any_nsg = getenv("GGML_METAL_Q6K_NSG");
+        const char * env_any_nr0 = getenv("GGML_METAL_Q6K_NR0");
+
+        const char * used_nsg = is_decode_like
+            ? ((env_dec_nsg && env_dec_nsg[0]) ? env_dec_nsg : env_any_nsg)
+            : ((env_pp_nsg  && env_pp_nsg[0])  ? env_pp_nsg  : env_any_nsg);
+        const char * used_nr0 = is_decode_like
+            ? ((env_dec_nr0 && env_dec_nr0[0]) ? env_dec_nr0 : env_any_nr0)
+            : ((env_pp_nr0  && env_pp_nr0[0])  ? env_pp_nr0  : env_any_nr0);
+
+        GGML_LOG_DEBUG(
+            "%s: Q6_K mul_mv_id select: is_decode=%d name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) pp(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
+            __func__, (int) is_decode_like, name, res.nr0, res.nr1, res.nsg, res.smem,
+            used_nsg ? used_nsg : "", used_nr0 ? used_nr0 : "",
+            env_dec_nsg ? env_dec_nsg : "", env_dec_nr0 ? env_dec_nr0 : "",
+            env_pp_nsg ? env_pp_nsg : "", env_pp_nr0 ? env_pp_nr0 : "",
+            env_any_nsg ? env_any_nsg : "", env_any_nr0 ? env_any_nr0 : "");
+    }
+
     return res;
 }
 

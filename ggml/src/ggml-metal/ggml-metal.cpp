@@ -118,20 +118,61 @@ static void ggml_metal_log_offload_decision_(
             decision ? "METAL" : "CPU",
             reason ? reason : "no-reason");
 }
-static bool ggml_metal_op_is_decode_like_(const ggml_tensor * op) {
+
+struct ggml_metal_decode_shape_class_ {
+    bool    is_decode_like;
+    bool    is_decode_strict;
+    bool    is_decode_small_mat;
+    bool    is_pp_small_batch;
+    int64_t bs;
+    int64_t aux_batch;
+};
+
+static ggml_metal_decode_shape_class_ ggml_metal_classify_decode_shape_(const ggml_tensor * op) {
+    ggml_metal_decode_shape_class_ cls = {
+        /* .is_decode_like      = */ false,
+        /* .is_decode_strict    = */ false,
+        /* .is_decode_small_mat = */ false,
+        /* .is_pp_small_batch   = */ false,
+        /* .bs                  = */ 0,
+        /* .aux_batch           = */ 1,
+    };
+    
     if (op == NULL) {
-        return false;
+        return cls;
     }
-
-    if (op->op == GGML_OP_MUL_MAT) {
-        return op->ne[1] <= 1;
+    
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            cls.bs = op->ne[1];
+            cls.aux_batch = (int64_t) op->ne[2] * (int64_t) op->ne[3];
+            
+            cls.is_decode_like   = (op->ne[1] <= 1);
+            cls.is_decode_strict = (op->ne[1] == 1 && op->ne[2] == 1 && op->ne[3] == 1);
+            cls.is_decode_small_mat =
+            (op->ne[1] == 1 && cls.aux_batch > 1 && cls.aux_batch <= 8);
+            cls.is_pp_small_batch =
+            (op->ne[1] > 1 && op->ne[1] <= 8);
+            break;
+            
+        case GGML_OP_MUL_MAT_ID:
+            cls.bs = op->ne[2];
+            cls.aux_batch = (int64_t) op->ne[2] * (int64_t) op->ne[3];
+            
+            cls.is_decode_like   = (op->ne[2] <= 1);
+            cls.is_decode_strict = (op->ne[2] == 1 && op->ne[3] == 1);
+            cls.is_decode_small_mat =
+            (op->ne[2] == 1 && op->ne[3] > 1 && op->ne[3] <= 8);
+            cls.is_pp_small_batch =
+            (op->ne[2] > 1 && op->ne[2] <= 8);
+            break;
+            
+        default:
+            break;
     }
-    if (op->op == GGML_OP_MUL_MAT_ID) {
-        return op->ne[2] <= 1;
-    }
-    return false;
+    
+    return cls;
 }
-
 static int ggml_metal_env_mgpu_small_mat_offload_max_bs_(void) {
     const char * v = getenv("GGML_METAL_MGPU_SMALL_MAT_OFFLOAD_MAX_BS");
     if (v == NULL || v[0] == '\0') {
@@ -1011,19 +1052,22 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 }
 
 static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (op == NULL) {
+         ggml_metal_log_offload_decision_(dev, op, -1, false, "op-null");
+          return false;
+      }
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    const ggml_metal_decode_shape_class_ cls = ggml_metal_classify_decode_shape_(op);
 
     const bool    is_mgpu            = ggml_metal_env_is_mgpu_enabled_();
     const int     mgpu_decode_min_bs = ggml_metal_env_mgpu_mul_mat_decode_min_bs_();
-    const int64_t bs                 = get_op_batch_size(op);
-    const bool    is_decode_like     = ggml_metal_op_is_decode_like_(op);
+
+    const int64_t bs                 = cls.bs;
+    const bool    is_decode_like     = cls.is_decode_like;
     const int64_t offload_min_bs     = ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
     int64_t       effective_offload_min_bs = offload_min_bs;
     const int     small_mat_offload_max_bs = ggml_metal_env_mgpu_small_mat_offload_max_bs_();
-    bool          small_mat_override = false;    if (op == NULL) {
-        ggml_metal_log_offload_decision_(dev, op, -1, false, "op-null");
-        return false;
-    }
+    bool          small_mat_override = false;
 
     // Limit this hook to matmul-like ops only.
     if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
@@ -1036,17 +1080,48 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
         const bool ok = bs >= offload_min_bs;
         ggml_metal_log_offload_decision_(
             dev, op, bs, ok,
-            ok ? "single-gpu-batch-ok" : "single-gpu-batch-too-small");
+            ok
+            ? (cls.is_decode_strict ? "single-gpu-decode-strict-batch-ok"
+               : cls.is_decode_small_mat ? "single-gpu-decode-small-mat-batch-ok"
+               : "single-gpu-batch-ok")
+            : "single-gpu-batch-too-small");
         return ok;
     }
 
     // MGPU policy:
-    // - reopen PP-only offload for MUL_MAT_ID
-    // - keep decode-like tiny-batch matmul/id on CPU for safety
-    if (is_decode_like && bs <= mgpu_decode_min_bs) {
-        ggml_metal_log_offload_decision_(dev, op, bs, false, "mgpu-decode-guard");
+    //
+    // 1) decode_strict:
+    //    reopen aggressively for both MUL_MAT and MUL_MAT_ID.
+    //
+    // 2) decode_small_mat:
+    //    reopen more aggressively for MUL_MAT_ID than for MUL_MAT.
+    //
+    // 3) generic decode-like:
+    //    keep the old decode guard.
+    if (cls.is_decode_strict) {
+        const int env_decode_offload_min_bs = ggml_metal_env_mgpu_decode_offload_min_bs_();
+        effective_offload_min_bs = env_decode_offload_min_bs >= 0 ? env_decode_offload_min_bs : 0;
+    } else if (cls.is_decode_small_mat) {
+        if (op->op == GGML_OP_MUL_MAT_ID) {
+            const int env_decode_offload_min_bs = ggml_metal_env_mgpu_decode_offload_min_bs_();
+            effective_offload_min_bs = env_decode_offload_min_bs >= 0 ? env_decode_offload_min_bs : 0;
+            small_mat_override = true;
+        } else if (op->op == GGML_OP_MUL_MAT) {
+            if (small_mat_offload_max_bs >= 0 && bs <= small_mat_offload_max_bs) {
+                const int env_decode_offload_min_bs = ggml_metal_env_mgpu_decode_offload_min_bs_();
+                if (env_decode_offload_min_bs >= 0) {
+                    effective_offload_min_bs = env_decode_offload_min_bs;
+                    small_mat_override = true;
+                }
+            }
+        }
+    } else if (is_decode_like && bs <= mgpu_decode_min_bs) {
+        ggml_metal_log_offload_decision_(
+            dev, op, bs, false,
+            op->op == GGML_OP_MUL_MAT_ID ? "mgpu-mul_mat_id-decode-guard" : "mgpu-mul_mat-decode-guard");
         return false;
     }
+    
     // MGPU decode override:
     // allow small decode-like matmul paths to bypass the generic device threshold
     // when explicitly requested by env. This is meant for TG/MoE investigation.
@@ -1054,9 +1129,12 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
         (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID)) {
         const int env_decode_offload_min_bs = ggml_metal_env_mgpu_decode_offload_min_bs_();
         if (env_decode_offload_min_bs >= 0) {
-            effective_offload_min_bs = env_decode_offload_min_bs;
+            if (!cls.is_decode_strict && !cls.is_decode_small_mat) {
+                    effective_offload_min_bs = env_decode_offload_min_bs;
+            }
         }
     }
+    
     // MGPU small-mat override:
     // allow small TG/MoE matmul paths (e.g. bs=16) to bypass the generic device
     // threshold even when they are not classified as decode-like.
@@ -1073,7 +1151,8 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
     
     if (ggml_metal_env_offload_debug_()) {
         fprintf(stderr,
-            "ggml-metal offload-threshold: dev='%s' op=%s tensor='%s' bs=%lld offload_min_bs=%lld effective_offload_min_bs=%lld is_mgpu=%d is_decode_like=%d small_mat_offload_max_bs=%d small_mat_override=%d\n",
+            "ggml-metal offload-threshold: dev='%s' op=%s tensor='%s' bs=%lld offload_min_bs=%lld effective_offload_min_bs=%lld is_mgpu=%d is_decode_like=%d is_decode_strict=%d is_decode_small_mat=%d is_pp_small_batch=%d aux_batch=%lld small_mat_offload_max_bs=%d small_mat_override=%d\n",
+
             ggml_backend_dev_description(dev),
             ggml_metal_op_name_(op->op),
             op->name[0] ? op->name : "(unnamed)",
@@ -1082,6 +1161,10 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
             (long long) effective_offload_min_bs,
             (int) is_mgpu,
             (int) is_decode_like,
+            (int) cls.is_decode_strict,
+            (int) cls.is_decode_small_mat,
+            (int) cls.is_pp_small_batch,
+            (long long) cls.aux_batch,
             (int) small_mat_offload_max_bs,
             (int) small_mat_override);
     }
@@ -1092,7 +1175,13 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
 
     ggml_metal_log_offload_decision_(
         dev, op, bs, true,
-        op->op == GGML_OP_MUL_MAT_ID ? "mgpu-pp-reopen-mul_mat_id" : "mgpu-batch-ok");
+        cls.is_decode_strict
+            ? (op->op == GGML_OP_MUL_MAT_ID ? "mgpu-decode-strict-mul_mat_id" : "mgpu-decode-strict-mul_mat")
+            : cls.is_decode_small_mat
+                ? (op->op == GGML_OP_MUL_MAT_ID ? "mgpu-decode-small-mat-mul_mat_id" : "mgpu-decode-small-mat-mul_mat")
+                : op->op == GGML_OP_MUL_MAT_ID
+                    ? "mgpu-generic-mul_mat_id"
+                    : "mgpu-generic-mul_mat");
 
     return true;
 }
