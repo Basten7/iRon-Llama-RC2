@@ -1,0 +1,149 @@
+Paramètres Metal tuning – récapitulatif compact
+===============================================
+
+[1] Runtime / sélection device
+------------------------------
+GGML_LOG_LEVEL=info
+  Niveau global de logs.
+
+GGML_METAL_DEVICE_INDEX=1[,2,...]
+  Sélection du/des GPU Metal à utiliser.
+
+GGML_METAL_FORCE_PRIVATE=1
+  Force les buffers privés GPU.
+
+GGML_METAL_VRAM_RESERVE_MB=2048
+  Réserve une marge de VRAM.
+
+GGML_METAL_MMAP_PREFETCH=1
+  Préfetch avec --mmap 1.
+
+GGML_METAL_N_CB=2
+  Nombre de command buffers / profondeur de soumission.
+
+
+[2] Concurrency / graph / scheduling
+------------------------------------
+GGML_METAL_CONCURRENCY_DISABLE=1
+  Désactive la concurrence Metal.
+
+GGML_METAL_CONCURRENCY_FORCE=1
+  Force la concurrence Metal.
+  NOTE: ne pas utiliser en même temps que CONCURRENCY_DISABLE=1.
+
+GGML_METAL_GRAPH_LOCK=1
+  Verrouille davantage le graph/scheduling.
+
+GGML_METAL_DECODE_SCHED=1
+  Active le scheduler decode spécifique.
+
+GGML_METAL_DECODE_NODES_MAX=256
+  Limite de noeuds pour le scheduler decode.
+
+
+[3] Debug / logs
+----------------
+GGML_METAL_DEBUG=1
+  Debug général Metal.
+
+GGML_METAL_FA_LOG=1
+  Logs Flash Attention.
+
+
+[4] Flash Attention
+-------------------
+GGML_METAL_FA_NSG=8
+  NSG pour le chemin Flash Attention.
+
+GGML_METAL_FA_VEC=0
+  Variante vectorisée / non vectorisée FA.
+
+
+[5] Policy d’offload MGPU decode
+--------------------------------
+GGML_METAL_MGPU_MUL_MAT_DECODE_MIN_BS=0
+  Seuil bas pour garde decode-like.
+
+GGML_METAL_MGPU_DECODE_OFFLOAD_MIN_BS=1
+  Seuil d’offload decode spécifique MGPU.
+
+GGML_METAL_MGPU_SMALL_MAT_OFFLOAD_MAX_BS=8
+  Réouverture des small-mat en MGPU.
+
+
+[6] Tuning mul_mv non-ID
+------------------------
+GGML_METAL_F32_NR0=<v>
+  NR0 pour certains chemins F32 mat-vec.
+
+GGML_METAL_F16_NR0=<v>
+  NR0 pour certains chemins F16 mat-vec.
+
+GGML_METAL_Q4K_NR0=<v>
+  NR0 générique Q4_K.
+
+GGML_METAL_Q6K_NR0=<v>
+  NR0 générique Q6_K.
+
+GGML_METAL_PP_Q6K_NR0=<v>
+  NR0 Q6_K côté PP si pris en charge par la sélection pipeline.
+
+
+[7] Tuning mul_mv_id pipeline-side (recommandé)
+-----------------------------------------------
+GGML_METAL_DECODE_Q4K_ID_NR0=<v>
+GGML_METAL_DECODE_Q4K_ID_NSG=<v>
+  Tuning decode pour Q4_K / MUL_MAT_ID au niveau sélection pipeline.
+  C’est la bonne famille de variables pour les tests decode Q4_K ID.
+
+GGML_METAL_DECODE_Q6K_ID_NR0=<v>
+GGML_METAL_DECODE_Q6K_ID_NSG=<v>
+  Tuning decode pour Q6_K / MUL_MAT_ID au niveau sélection pipeline.
+
+GGML_METAL_PP_Q4K_ID_NR0=<v>
+GGML_METAL_PP_Q4K_ID_NSG=<v>
+  Tuning PP pour Q4_K / MUL_MAT_ID.
+
+GGML_METAL_PP_Q6K_ID_NR0=<v>
+GGML_METAL_PP_Q6K_ID_NSG=<v>
+  Tuning PP pour Q6_K / MUL_MAT_ID.
+
+
+[8] Paramètres anciens / à éviter pour mul_mv_id
+------------------------------------------------
+GGML_METAL_MMV_DEC_NR0=<v>
+GGML_METAL_MMV_DEC_NSG=<v>
+GGML_METAL_MMV_ID_DEC_NR0=<v>
+GGML_METAL_MMV_ID_DEC_NSG=<v>
+
+  Anciens overrides appliqués trop tard (au point d’usage).
+  Peuvent donner de bonnes perfs bench mais des sorties incorrectes.
+  À éviter pour mul_mv_id ; préférer les variables DECODE_Q*_ID_*.
+
+
+[9] Valeurs de test utilisées / utiles
+--------------------------------------
+NR0 testés ou visés :
+  2, 4, 8, 10, 12
+
+NSG testés ou visés :
+  1, 2, 4, 8
+
+Exemple Q4_K / MUL_MAT_ID / decode :
+  export GGML_METAL_DECODE_Q4K_ID_NR0=8
+  export GGML_METAL_DECODE_Q4K_ID_NSG=2
+
+
+[10] Rappels pratiques
+----------------------
+- Bench seul ne suffit pas : toujours valider aussi avec llama-cli et llama-server.
+- Pour mul_mv_id, le tuning correct doit se faire dans la sélection pipeline,
+  pas par réécriture locale de nr0/nsg après sélection.
+- Éviter les doublons dans l’environnement :
+    GGML_METAL_DECODE_SCHED
+    GGML_METAL_GRAPH_LOCK
+- Choisir soit :
+    GGML_METAL_CONCURRENCY_DISABLE=1
+  soit :
+    GGML_METAL_CONCURRENCY_FORCE=1
+  mais pas les deux.
