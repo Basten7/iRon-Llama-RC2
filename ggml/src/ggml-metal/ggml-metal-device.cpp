@@ -716,22 +716,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
-    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
-    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(int32_t, ne1, op->src[1], ne);
+
     // Decode path identification must match the _id_ variant (mul_mv_id) to ensure that
     // GGML_METAL_DECODE_Q4K_NR0/NSG affect BOTH pipelines (id + non-id).
     //
     // In llama.cpp, many "matvec decode-like" ops have ne11 == 1 but may carry extra
     // batching/splitting in ne12/ne13, so restricting decode to (ne12==1 && ne13==1)
     // causes overrides to be silently ignored.
+    //
     // Decode heuristics for env overrides (NR0/NSG tuning):
     // - strict decode: classic mat-vec with no extra batching in higher dims
     // - decode-like: still a "mat-vec" (ne11==1) but can carry light batching/splitting in ne12/ne13
     //   We keep this bounded to avoid misclassifying prefill/small-batch paths.
     const bool is_decode_strict = (ne11 == 1 && ne12 == 1 && ne13 == 1);
-    const int64_t aux_batch      = (int64_t) ne12 * (int64_t) ne13;
-    const bool is_decode_like    = (ne11 == 1 && aux_batch <= 8);
+    const int64_t aux_batch     = (int64_t) ne12 * (int64_t) ne13;
+    const bool is_decode_like   = (ne11 == 1 && aux_batch <= 8);
+
     char base[256];
     char name[256];
 
@@ -746,279 +750,341 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
     const char * suffix = "";
 
+    // Allowed NR0 set for Q4_K / Q6_K experiments in this V0.1.
+    auto nr0_allowed_qk_test_ = [](int v) -> bool {
+        return v == 2 || v == 4 || v == 8 || v == 10 || v == 12;
+    };
+
+    auto nr0_allowed_qk_leq_ = [&](int v_req) -> int {
+        static const int allowed[] = { 12, 10, 8, 4, 2 };
+        for (int v : allowed) {
+            if (v <= v_req) {
+                return v;
+            }
+        }
+        return 2;
+    };
+
     // use custom matrix x vector kernel
     switch (tsrc0) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
-            {
-                if (ne00 < 32) {
-                    nsg = 1;
-                    nr0 = 32;
-                    nr1 = 1;
-                    suffix = "_short";
-                } else {
-                    nsg = std::min(4, (ne00 + 127) / 128);
-                    nr0 = 2;
-                    nr1 = 1;
-                    smem = 32*sizeof(float)*nr0;
-                    suffix = ne00 % 4 == 0 ? "_4" : "";
-                }
-// Optional override: rows per threadgroup for F32/F16 mat-vec (non-short path).
-// This maps to args.nr0 consumed by the Metal kernel dispatch switch.
-// Usage:
-//   export GGML_METAL_F32_NR0=8
-//   export GGML_METAL_F16_NR0=8
-                                if (strcmp(suffix, "_short") != 0) {
-                                    const bool is_f32 = (tsrc0 == GGML_TYPE_F32);
-                                    const bool is_f16 = (tsrc0 == GGML_TYPE_F16);
-                                    const char * env = is_f32 ? getenv("GGML_METAL_F32_NR0")
-                                                     : is_f16 ? getenv("GGML_METAL_F16_NR0")
-                                                              : NULL;
-                                    if (env) {
-                                        const int v = atoi(env);
-                                        // Supported NR0 values are those compiled into the Metal dispatch switch.
-                                        if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16 || v == 32) {
-                                            nr0  = v;
-                                            smem = 32*sizeof(float)*nr0;
-                                        }
-                                        static bool s_logged_f32 = false;
-                                        static bool s_logged_f16 = false;
-                                        bool & s_logged = is_f32 ? s_logged_f32 : s_logged_f16;
-                                        if (!s_logged) {
-                                            s_logged = true;
-                                            GGML_LOG_INFO("%s: %s NR0 override = %d\n",
-                                                          __func__, is_f32 ? "F32" : "F16", (int) nr0);
-                                        }
-                                    }
-                                }
-            } break;
-        case GGML_TYPE_Q4_0:
-            {
-                nsg = N_SG_Q4_0;
-                nr0 = N_R0_Q4_0;
-            } break;
-        case GGML_TYPE_Q4_1:
-            {
-                nsg = N_SG_Q4_1;
-                nr0 = N_R0_Q4_1;
-            } break;
-        case GGML_TYPE_Q5_0:
-            {
-                nsg = N_SG_Q5_0;
-                nr0 = N_R0_Q5_0;
-            } break;
-        case GGML_TYPE_Q5_1:
-            {
-                nsg = N_SG_Q5_1;
-                nr0 = N_R0_Q5_1;
-            } break;
-        case GGML_TYPE_Q8_0:
-            {
-                nsg = N_SG_Q8_0;
-                nr0 = N_R0_Q8_0;
-                smem = 32*sizeof(float)*N_R0_Q8_0;
-            } break;
-        case GGML_TYPE_MXFP4:
-            {
-                nsg = N_SG_MXFP4;
-                nr0 = N_R0_MXFP4;
-                smem = 32*sizeof(float);
-            } break;
-        case GGML_TYPE_Q2_K:
-            {
-                nsg = N_SG_Q2_K;
-                nr0 = N_R0_Q2_K;
-            } break;
-        case GGML_TYPE_Q3_K:
-            {
-                nsg = N_SG_Q3_K;
-                nr0 = N_R0_Q3_K;
-            } break;
-        case GGML_TYPE_Q4_K:
-            {
-                nsg = N_SG_Q4_K;
-                nr0 = N_R0_Q4_K;
-                // Phase-aware overrides for Q4_K mul_mv:
-                // - decode-like: GGML_METAL_DECODE_Q4K_*
-                // - PP/non-decode: GGML_METAL_PP_Q4K_*
-                // - fallback: GGML_METAL_Q4K_*
-                const char * env_q4k_nsg =
-                    ggml_metal_getenv_phase_pref_(is_decode_like,
-                                                  "GGML_METAL_DECODE_Q4K_NSG",
-                                                  "GGML_METAL_PP_Q4K_NSG",
-                                                  "GGML_METAL_Q4K_NSG");
-                const char * env_q4k_nr0 =
-                    ggml_metal_getenv_phase_pref_(is_decode_like,
-                                                  "GGML_METAL_DECODE_Q4K_NR0",
-                                                  "GGML_METAL_PP_Q4K_NR0",
-                                                  "GGML_METAL_Q4K_NR0");
-                
-                if (env_q4k_nsg && env_q4k_nsg[0]) {
-                    const int v = atoi(env_q4k_nsg);
-                    if (v >= 1 && v <= 8) {
-                        nsg = v;
-                    }
-                }
-                
-                if (env_q4k_nr0 && env_q4k_nr0[0]) {
-                    const int v_req = atoi(env_q4k_nr0);
-                    // Only values with dedicated entry points should be selected.
-                    // If the user asks something else, clamp down to the nearest allowed <= request.
-                    const int v = ggml_metal_nr0_allowed_leq_(v_req);
-                    if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
-                        nr0 = v;
-                    }
-                }
-                
-                // Safety clamp: avoid invalid (ne00 < nsg*nr0) combos that would select a kernel
-                // specialization incompatible with the actual problem size (common with tiny heads).
-                // Keep behavior consistent with Q6_K: clamp NR0 down to the nearest allowed <= (ne00/nsg).
-                if (nsg < 1) nsg = 1;
-                if (nr0 < 2) nr0 = 2;
-                const int max_nr0 = (int) (ne00 / nsg);
-                if (max_nr0 >= 2) {
-                    const int nr0_clamped = ggml_metal_nr0_allowed_leq_(max_nr0);
-                    if (nr0 > nr0_clamped) {
-                        nr0 = nr0_clamped;
-                    }
-                } else {
-                    // Degenerate: force a minimal safe config.
-                    nsg = 1;
-                    nr0 = 2;
-                }
-            } break;
-        case GGML_TYPE_Q5_K:
-            {
-                nsg = N_SG_Q5_K;
-                nr0 = N_R0_Q5_K;
-            } break;
-        case GGML_TYPE_Q6_K:
-            {
-                nsg = N_SG_Q6_K;
-                nr0 = N_R0_Q6_K;
-                // Phase-aware overrides for Q6_K mul_mv:
-                // - decode-like: GGML_METAL_DECODE_Q6K_*
-                // - PP/non-decode: GGML_METAL_PP_Q6K_*
-                // - fallback: GGML_METAL_Q6K_*
-                const char * env_q6k_nsg =
-                    ggml_metal_getenv_phase_pref_(is_decode_like,
-                                                  "GGML_METAL_DECODE_Q6K_NSG",
-                                                  "GGML_METAL_PP_Q6K_NSG",
-                                                  "GGML_METAL_Q6K_NSG");
-                if (env_q6k_nsg) {
-                    const int v = atoi(env_q6k_nsg);
-                    if (v >= 1 && v <= 8) {
-                        nsg = v;
-                    }
-                }
-                
-                // Optional override: rows per threadgroup for Q6_K mat-vec.
-                // NOTE: NR0 is compile-time in the Metal kernel. Only values that have a dedicated
-                // kernel entry point are allowed here.
-                // Usage:
-                //   export GGML_METAL_PP_Q6K_NR0=128
-                //   export GGML_METAL_DECODE_Q6K_NR0=64
-                const char * env_q6k_nr0 =
-                    ggml_metal_getenv_phase_pref_(is_decode_like,
-                                                  "GGML_METAL_DECODE_Q6K_NR0",
-                                                  "GGML_METAL_PP_Q6K_NR0",
-                                                  "GGML_METAL_Q6K_NR0");
-                 if (env_q6k_nr0) {
-                   const int v = atoi(env_q6k_nr0);
-                    if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
-                        nr0 = v;
-                    }
-                    static bool s_logged_q6k_nr0 = false;
-                    if (!s_logged_q6k_nr0) {
-                        s_logged_q6k_nr0 = true;
-                        GGML_LOG_INFO("%s: Q6_K NR0 override = %d", __func__, (int) nr0);
-                    }
-                }
-                
-                // Safety clamp: avoid invalid (ne00 < nsg*nr0) combos.
-                if (nsg < 1) {
-                    nsg = 1;
-                }
-                const int max_nr0 = (int) (ne00 / nsg);
-                if (max_nr0 >= 2) {
-                    const int nr0_clamped = ggml_metal_nr0_allowed_leq_(max_nr0);
-                    if (nr0 > nr0_clamped) {
-                        nr0 = nr0_clamped;
-                    }
-                } else {
-                    nsg = 1;
-                    nr0 = 2;
-                }
-                // Optional visibility: log once when decode-like heuristics triggers.
-                // This helps validate why GGML_METAL_DECODE_Q6K_* applies.
-                static bool s_logged_decode_like = false;
-                if (!s_logged_decode_like && is_decode_like && !is_decode_strict) {
-                    s_logged_decode_like = true;
-                    GGML_LOG_INFO("%s: decode-like mul_mv detected (ne11=%d ne12=%d ne13=%d); DECODE_* envs may apply\n",
-                                  __func__, (int) ne11, (int) ne12, (int) ne13);
-                }
-            } break;
-        case GGML_TYPE_IQ2_XXS:
-            {
-                nsg = N_SG_IQ2_XXS;
-                nr0 = N_R0_IQ2_XXS;
-                smem = 256*8+128;
-            } break;
-        case GGML_TYPE_IQ2_XS:
-            {
-                nsg = N_SG_IQ2_XS;
-                nr0 = N_R0_IQ2_XS;
-                smem = 512*8+128;
-            } break;
-        case GGML_TYPE_IQ3_XXS:
-            {
-                nsg = N_SG_IQ3_XXS;
-                nr0 = N_R0_IQ3_XXS;
-                smem = 256*4+128;
-            } break;
-        case GGML_TYPE_IQ3_S:
-            {
-                nsg = N_SG_IQ3_S;
-                nr0 = N_R0_IQ3_S;
-                smem = 512*4;
-            } break;
-        case GGML_TYPE_IQ2_S:
-            {
-                nsg = N_SG_IQ2_S;
-                nr0 = N_R0_IQ2_S;
-            } break;
-        case GGML_TYPE_IQ1_S:
-            {
-                nsg = N_SG_IQ1_S;
-                nr0 = N_R0_IQ1_S;
-            } break;
-        case GGML_TYPE_IQ1_M:
-            {
-                nsg = N_SG_IQ1_M;
-                nr0 = N_R0_IQ1_M;
-            } break;
-        case GGML_TYPE_IQ4_NL:
-            {
-                nsg = N_SG_IQ4_NL;
-                nr0 = N_R0_IQ4_NL;
-                smem = 32*sizeof(float);
-            } break;
-        case GGML_TYPE_IQ4_XS:
-            {
-                nsg = N_SG_IQ4_XS;
-                nr0 = N_R0_IQ4_XS;
-                smem = 32*sizeof(float);
-            } break;
-        default:
-            {
-                GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
-                GGML_ABORT("not implemented");
+        {
+            if (ne00 < 32) {
+                nsg = 1;
+                nr0 = 32;
+                nr1 = 1;
+                suffix = "_short";
+            } else {
+                nsg = std::min(4, (ne00 + 127) / 128);
+                nr0 = 2;
+                nr1 = 1;
+                smem = 32 * sizeof(float) * nr0;
+                suffix = ne00 % 4 == 0 ? "_4" : "";
             }
+
+            // Optional override: rows per threadgroup for F32/F16/BF16 mat-vec (non-short path).
+            // Phase-aware precedence:
+            //   decode-like: GGML_METAL_DECODE_F32_NR0 / F16 / BF16
+            //   PP/non-decode: GGML_METAL_PP_F32_NR0 / F16 / BF16
+            //   fallback: GGML_METAL_F32_NR0 / F16 / BF16
+            if (strcmp(suffix, "_short") != 0) {
+                const bool is_f32  = (tsrc0 == GGML_TYPE_F32);
+                const bool is_f16  = (tsrc0 == GGML_TYPE_F16);
+                const bool is_bf16 = (tsrc0 == GGML_TYPE_BF16);
+
+                const char * env = is_f32
+                    ? ggml_metal_getenv_phase_pref_(is_decode_like,
+                          "GGML_METAL_DECODE_F32_NR0",
+                          "GGML_METAL_PP_F32_NR0",
+                          "GGML_METAL_F32_NR0")
+                    : is_f16
+                        ? ggml_metal_getenv_phase_pref_(is_decode_like,
+                              "GGML_METAL_DECODE_F16_NR0",
+                              "GGML_METAL_PP_F16_NR0",
+                              "GGML_METAL_F16_NR0")
+                        : is_bf16
+                            ? ggml_metal_getenv_phase_pref_(is_decode_like,
+                                  "GGML_METAL_DECODE_BF16_NR0",
+                                  "GGML_METAL_PP_BF16_NR0",
+                                  "GGML_METAL_BF16_NR0")
+                            : NULL;
+
+                if (env && env[0]) {
+                    const int v = atoi(env);
+                    // Supported NR0 values are those compiled into the Metal dispatch switch.
+                    if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16 || v == 32) {
+                        nr0  = v;
+                        smem = 32 * sizeof(float) * nr0;
+                    }
+
+                    static bool s_logged_f32  = false;
+                    static bool s_logged_f16  = false;
+                    static bool s_logged_bf16 = false;
+                    bool & s_logged = is_f32 ? s_logged_f32 : (is_f16 ? s_logged_f16 : s_logged_bf16);
+
+                    if (!s_logged) {
+                        s_logged = true;
+                        GGML_LOG_INFO(
+                            "%s: %s NR0 override = %d (decode_like=%d)\n",
+                            __func__,
+                            is_f32 ? "F32" : (is_f16 ? "F16" : "BF16"),
+                            (int) nr0,
+                            (int) is_decode_like);
+                    }
+                }
+            }
+        } break;
+
+        case GGML_TYPE_Q4_0:
+        {
+            nsg = N_SG_Q4_0;
+            nr0 = N_R0_Q4_0;
+        } break;
+
+        case GGML_TYPE_Q4_1:
+        {
+            nsg = N_SG_Q4_1;
+            nr0 = N_R0_Q4_1;
+        } break;
+
+        case GGML_TYPE_Q5_0:
+        {
+            nsg = N_SG_Q5_0;
+            nr0 = N_R0_Q5_0;
+        } break;
+
+        case GGML_TYPE_Q5_1:
+        {
+            nsg = N_SG_Q5_1;
+            nr0 = N_R0_Q5_1;
+        } break;
+
+        case GGML_TYPE_Q8_0:
+        {
+            nsg = N_SG_Q8_0;
+            nr0 = N_R0_Q8_0;
+            smem = 32 * sizeof(float) * N_R0_Q8_0;
+        } break;
+
+        case GGML_TYPE_MXFP4:
+        {
+            nsg = N_SG_MXFP4;
+            nr0 = N_R0_MXFP4;
+            smem = 32 * sizeof(float);
+        } break;
+
+        case GGML_TYPE_Q2_K:
+        {
+            nsg = N_SG_Q2_K;
+            nr0 = N_R0_Q2_K;
+        } break;
+
+        case GGML_TYPE_Q3_K:
+        {
+            nsg = N_SG_Q3_K;
+            nr0 = N_R0_Q3_K;
+        } break;
+
+        case GGML_TYPE_Q4_K:
+        {
+            nsg = N_SG_Q4_K;
+            nr0 = N_R0_Q4_K;
+
+            // Phase-aware overrides for Q4_K mul_mv:
+            // - decode-like: GGML_METAL_DECODE_Q4K_*
+            // - PP/non-decode: GGML_METAL_PP_Q4K_*
+            // - fallback: GGML_METAL_Q4K_*
+            const char * env_q4k_nsg =
+                ggml_metal_getenv_phase_pref_(is_decode_like,
+                                              "GGML_METAL_DECODE_Q4K_NSG",
+                                              "GGML_METAL_PP_Q4K_NSG",
+                                              "GGML_METAL_Q4K_NSG");
+
+            const char * env_q4k_nr0 =
+                ggml_metal_getenv_phase_pref_(is_decode_like,
+                                              "GGML_METAL_DECODE_Q4K_NR0",
+                                              "GGML_METAL_PP_Q4K_NR0",
+                                              "GGML_METAL_Q4K_NR0");
+
+            if (env_q4k_nsg && env_q4k_nsg[0]) {
+                const int v = atoi(env_q4k_nsg);
+                if (v >= 1 && v <= 8) {
+                    nsg = v;
+                }
+            }
+
+            if (env_q4k_nr0 && env_q4k_nr0[0]) {
+                const int v_req = atoi(env_q4k_nr0);
+                const int v = nr0_allowed_qk_leq_(v_req);
+                if (nr0_allowed_qk_test_(v)) {
+                    nr0 = v;
+                }
+            }
+
+            // Safety clamp: avoid invalid (ne00 < nsg*nr0) combos that would select a kernel
+            // specialization incompatible with the actual problem size (common with tiny heads).
+            if (nsg < 1) {
+                nsg = 1;
+            }
+            if (nr0 < 2) {
+                nr0 = 2;
+            }
+
+            const int max_nr0 = (int) (ne00 / nsg);
+            if (max_nr0 >= 2) {
+                const int nr0_clamped = nr0_allowed_qk_leq_(max_nr0);
+                if (nr0 > nr0_clamped) {
+                    nr0 = nr0_clamped;
+                }
+            } else {
+                // Degenerate: force a minimal safe config.
+                nsg = 1;
+                nr0 = 2;
+            }
+        } break;
+
+        case GGML_TYPE_Q5_K:
+        {
+            nsg = N_SG_Q5_K;
+            nr0 = N_R0_Q5_K;
+        } break;
+
+        case GGML_TYPE_Q6_K:
+        {
+            nsg = N_SG_Q6_K;
+            nr0 = N_R0_Q6_K;
+
+            // Phase-aware overrides for Q6_K mul_mv:
+            // - decode-like: GGML_METAL_DECODE_Q6K_*
+            // - PP/non-decode: GGML_METAL_PP_Q6K_*
+            // - fallback: GGML_METAL_Q6K_*
+            const char * env_q6k_nsg =
+                ggml_metal_getenv_phase_pref_(is_decode_like,
+                                              "GGML_METAL_DECODE_Q6K_NSG",
+                                              "GGML_METAL_PP_Q6K_NSG",
+                                              "GGML_METAL_Q6K_NSG");
+
+            const char * env_q6k_nr0 =
+                ggml_metal_getenv_phase_pref_(is_decode_like,
+                                              "GGML_METAL_DECODE_Q6K_NR0",
+                                              "GGML_METAL_PP_Q6K_NR0",
+                                              "GGML_METAL_Q6K_NR0");
+
+            if (env_q6k_nsg && env_q6k_nsg[0]) {
+                const int v = atoi(env_q6k_nsg);
+                if (v >= 1 && v <= 8) {
+                    nsg = v;
+                }
+            }
+
+            if (env_q6k_nr0 && env_q6k_nr0[0]) {
+                const int v_req = atoi(env_q6k_nr0);
+                const int v = nr0_allowed_qk_leq_(v_req);
+                if (nr0_allowed_qk_test_(v)) {
+                    nr0 = v;
+                }
+            }
+
+            // Safety clamp: avoid invalid (ne00 < nsg*nr0) combos.
+            if (nsg < 1) {
+                nsg = 1;
+            }
+            if (nr0 < 2) {
+                nr0 = 2;
+            }
+
+            const int max_nr0 = (int) (ne00 / nsg);
+            if (max_nr0 >= 2) {
+                const int nr0_clamped = nr0_allowed_qk_leq_(max_nr0);
+                if (nr0 > nr0_clamped) {
+                    nr0 = nr0_clamped;
+                }
+            } else {
+                nsg = 1;
+                nr0 = 2;
+            }
+
+            // Optional visibility: log once when decode-like heuristics triggers.
+            static bool s_logged_decode_like = false;
+            if (!s_logged_decode_like && is_decode_like && !is_decode_strict) {
+                s_logged_decode_like = true;
+                GGML_LOG_INFO(
+                    "%s: decode-like mul_mv detected (ne11=%d ne12=%d ne13=%d); DECODE_* envs may apply\n",
+                    __func__, (int) ne11, (int) ne12, (int) ne13);
+            }
+        } break;
+
+        case GGML_TYPE_IQ2_XXS:
+        {
+            nsg = N_SG_IQ2_XXS;
+            nr0 = N_R0_IQ2_XXS;
+            smem = 256 * 8 + 128;
+        } break;
+
+        case GGML_TYPE_IQ2_XS:
+        {
+            nsg = N_SG_IQ2_XS;
+            nr0 = N_R0_IQ2_XS;
+            smem = 512 * 8 + 128;
+        } break;
+
+        case GGML_TYPE_IQ3_XXS:
+        {
+            nsg = N_SG_IQ3_XXS;
+            nr0 = N_R0_IQ3_XXS;
+            smem = 256 * 4 + 128;
+        } break;
+
+        case GGML_TYPE_IQ3_S:
+        {
+            nsg = N_SG_IQ3_S;
+            nr0 = N_R0_IQ3_S;
+            smem = 512 * 4;
+        } break;
+
+        case GGML_TYPE_IQ2_S:
+        {
+            nsg = N_SG_IQ2_S;
+            nr0 = N_R0_IQ2_S;
+        } break;
+
+        case GGML_TYPE_IQ1_S:
+        {
+            nsg = N_SG_IQ1_S;
+            nr0 = N_R0_IQ1_S;
+        } break;
+
+        case GGML_TYPE_IQ1_M:
+        {
+            nsg = N_SG_IQ1_M;
+            nr0 = N_R0_IQ1_M;
+        } break;
+
+        case GGML_TYPE_IQ4_NL:
+        {
+            nsg = N_SG_IQ4_NL;
+            nr0 = N_R0_IQ4_NL;
+            smem = 32 * sizeof(float);
+        } break;
+
+        case GGML_TYPE_IQ4_XS:
+        {
+            nsg = N_SG_IQ4_XS;
+            nr0 = N_R0_IQ4_XS;
+            smem = 32 * sizeof(float);
+        } break;
+
+        default:
+        {
+            GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
+            GGML_ABORT("not implemented");
+        }
     };
 
-    // Q4_K/Q6_K NR0 is compile-time in the Metal kernel entrypoint name. If nr0 differs from
-    // the default, we MUST pick the specialized entrypoint "_nr0_%d" (no silent fallback).
+    // Q4_K/Q6_K NR0 is compile-time in the Metal kernel entrypoint name.
+    // If nr0 differs from the default, we MUST pick the specialized entrypoint "_nr0_%d".
     if (tsrc0 == GGML_TYPE_Q4_K && nr0 != N_R0_Q4_K) {
         snprintf(base, 256, "kernel_mul_mv_%s_%s_nr0_%d%s",
                  ggml_type_name(tsrc0), ggml_type_name(tsrc1), nr0, suffix);
@@ -1031,7 +1097,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     }
 
     snprintf(name, 256, "%s_nsg=%d", base, nsg);
-    
+
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
@@ -1047,9 +1113,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     res.nr1  = nr1;
     res.nsg  = nsg;
     res.smem = smem;
-    
+
     // Instrumentation (enable with -lv 4): show the effective base/name + params, and which envs
-    // were eligible for *this* call (decode-like => DECODE_* takes precedence, else only ANY_*).
+    // were eligible for *this* call (decode-like => DECODE_* takes precedence, else PP_* then ANY_*).
     if ((tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q6_K) && tsrc1 == GGML_TYPE_F32) {
         const char * dec_nsg = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_DECODE_Q4K_NSG") : getenv("GGML_METAL_DECODE_Q6K_NSG");
         const char * dec_nr0 = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_DECODE_Q4K_NR0") : getenv("GGML_METAL_DECODE_Q6K_NR0");
@@ -1057,27 +1123,391 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         const char * pp_nr0  = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_PP_Q4K_NR0")     : getenv("GGML_METAL_PP_Q6K_NR0");
         const char * any_nsg = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_Q4K_NSG")        : getenv("GGML_METAL_Q6K_NSG");
         const char * any_nr0 = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_Q4K_NR0")        : getenv("GGML_METAL_Q6K_NR0");
-        // Which envs were eligible for *this* call:
-        // decode-like => DECODE_* takes precedence, else PP_* takes precedence, then ANY_*.
+
         const char * used_nsg = is_decode_like
             ? ((dec_nsg && dec_nsg[0]) ? dec_nsg : any_nsg)
-            : ((pp_nsg  && pp_nsg [0]) ? pp_nsg  : any_nsg);
+            : ((pp_nsg  && pp_nsg[0])  ? pp_nsg  : any_nsg);
         const char * used_nr0 = is_decode_like
             ? ((dec_nr0 && dec_nr0[0]) ? dec_nr0 : any_nr0)
-            : ((pp_nr0  && pp_nr0 [0]) ? pp_nr0  : any_nr0);
-        
-        GGML_LOG_DEBUG("%s: %s mul_mv select: is_decode=%d base='%s' name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) pp(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
-                       __func__,
-                       tsrc0 == GGML_TYPE_Q4_K ? "Q4_K" : "Q6_K",
-                       (int) is_decode_like, base, name,
-                       res.nr0, res.nr1, res.nsg, res.smem,
-                       used_nsg ? used_nsg : "", used_nr0 ? used_nr0 : "",
-                       dec_nsg ? dec_nsg : "", dec_nr0 ? dec_nr0 : "",
-                       pp_nsg ? pp_nsg : "", pp_nr0 ? pp_nr0 : "",
-                       any_nsg ? any_nsg : "", any_nr0 ? any_nr0 : "");
+            : ((pp_nr0  && pp_nr0[0])  ? pp_nr0  : any_nr0);
+
+        GGML_LOG_DEBUG(
+            "%s: %s mul_mv select: is_decode=%d base='%s' name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) pp(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
+            __func__,
+            tsrc0 == GGML_TYPE_Q4_K ? "Q4_K" : "Q6_K",
+            (int) is_decode_like, base, name,
+            res.nr0, res.nr1, res.nsg, res.smem,
+            used_nsg ? used_nsg : "", used_nr0 ? used_nr0 : "",
+            dec_nsg ? dec_nsg : "", dec_nr0 ? dec_nr0 : "",
+            pp_nsg ? pp_nsg : "", pp_nr0 ? pp_nr0 : "",
+            any_nsg ? any_nsg : "", any_nr0 ? any_nr0 : "");
     }
+
     return res;
 }
+//V0
+//ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
+//    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+//    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+//    // Decode path identification must match the _id_ variant (mul_mv_id) to ensure that
+//    // GGML_METAL_DECODE_Q4K_NR0/NSG affect BOTH pipelines (id + non-id).
+//    //
+//    // In llama.cpp, many "matvec decode-like" ops have ne11 == 1 but may carry extra
+//    // batching/splitting in ne12/ne13, so restricting decode to (ne12==1 && ne13==1)
+//    // causes overrides to be silently ignored.
+//    // Decode heuristics for env overrides (NR0/NSG tuning):
+//    // - strict decode: classic mat-vec with no extra batching in higher dims
+//    // - decode-like: still a "mat-vec" (ne11==1) but can carry light batching/splitting in ne12/ne13
+//    //   We keep this bounded to avoid misclassifying prefill/small-batch paths.
+//    const bool is_decode_strict = (ne11 == 1 && ne12 == 1 && ne13 == 1);
+//    const int64_t aux_batch      = (int64_t) ne12 * (int64_t) ne13;
+//    const bool is_decode_like    = (ne11 == 1 && aux_batch <= 8);
+//    char base[256];
+//    char name[256];
+//
+//    int nsg = 0; // number of simdgroups
+//    int nr0 = 0; // number of src0 rows per simdgroup
+//    int nr1 = 1; // number of src1 rows per threadgroup
+//
+//    size_t smem = 0; // shared memory
+//
+//    const ggml_type tsrc0 = op->src[0]->type;
+//    const ggml_type tsrc1 = op->src[1]->type;
+//
+//    const char * suffix = "";
+//
+//    // use custom matrix x vector kernel
+//    switch (tsrc0) {
+//        case GGML_TYPE_F32:
+//        case GGML_TYPE_F16:
+//        case GGML_TYPE_BF16:
+//            {
+//                if (ne00 < 32) {
+//                    nsg = 1;
+//                    nr0 = 32;
+//                    nr1 = 1;
+//                    suffix = "_short";
+//                } else {
+//                    nsg = std::min(4, (ne00 + 127) / 128);
+//                    nr0 = 2;
+//                    nr1 = 1;
+//                    smem = 32*sizeof(float)*nr0;
+//                    suffix = ne00 % 4 == 0 ? "_4" : "";
+//                }
+//// Optional override: rows per threadgroup for F32/F16 mat-vec (non-short path).
+//// This maps to args.nr0 consumed by the Metal kernel dispatch switch.
+//// Usage:
+////   export GGML_METAL_F32_NR0=8
+////   export GGML_METAL_F16_NR0=8
+//                                if (strcmp(suffix, "_short") != 0) {
+//                                    const bool is_f32 = (tsrc0 == GGML_TYPE_F32);
+//                                    const bool is_f16 = (tsrc0 == GGML_TYPE_F16);
+//                                    const char * env = is_f32 ? getenv("GGML_METAL_F32_NR0")
+//                                                     : is_f16 ? getenv("GGML_METAL_F16_NR0")
+//                                                              : NULL;
+//                                    if (env) {
+//                                        const int v = atoi(env);
+//                                        // Supported NR0 values are those compiled into the Metal dispatch switch.
+//                                        if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16 || v == 32) {
+//                                            nr0  = v;
+//                                            smem = 32*sizeof(float)*nr0;
+//                                        }
+//                                        static bool s_logged_f32 = false;
+//                                        static bool s_logged_f16 = false;
+//                                        bool & s_logged = is_f32 ? s_logged_f32 : s_logged_f16;
+//                                        if (!s_logged) {
+//                                            s_logged = true;
+//                                            GGML_LOG_INFO("%s: %s NR0 override = %d\n",
+//                                                          __func__, is_f32 ? "F32" : "F16", (int) nr0);
+//                                        }
+//                                    }
+//                                }
+//            } break;
+//        case GGML_TYPE_Q4_0:
+//            {
+//                nsg = N_SG_Q4_0;
+//                nr0 = N_R0_Q4_0;
+//            } break;
+//        case GGML_TYPE_Q4_1:
+//            {
+//                nsg = N_SG_Q4_1;
+//                nr0 = N_R0_Q4_1;
+//            } break;
+//        case GGML_TYPE_Q5_0:
+//            {
+//                nsg = N_SG_Q5_0;
+//                nr0 = N_R0_Q5_0;
+//            } break;
+//        case GGML_TYPE_Q5_1:
+//            {
+//                nsg = N_SG_Q5_1;
+//                nr0 = N_R0_Q5_1;
+//            } break;
+//        case GGML_TYPE_Q8_0:
+//            {
+//                nsg = N_SG_Q8_0;
+//                nr0 = N_R0_Q8_0;
+//                smem = 32*sizeof(float)*N_R0_Q8_0;
+//            } break;
+//        case GGML_TYPE_MXFP4:
+//            {
+//                nsg = N_SG_MXFP4;
+//                nr0 = N_R0_MXFP4;
+//                smem = 32*sizeof(float);
+//            } break;
+//        case GGML_TYPE_Q2_K:
+//            {
+//                nsg = N_SG_Q2_K;
+//                nr0 = N_R0_Q2_K;
+//            } break;
+//        case GGML_TYPE_Q3_K:
+//            {
+//                nsg = N_SG_Q3_K;
+//                nr0 = N_R0_Q3_K;
+//            } break;
+//        case GGML_TYPE_Q4_K:
+//            {
+//                nsg = N_SG_Q4_K;
+//                nr0 = N_R0_Q4_K;
+//                // Phase-aware overrides for Q4_K mul_mv:
+//                // - decode-like: GGML_METAL_DECODE_Q4K_*
+//                // - PP/non-decode: GGML_METAL_PP_Q4K_*
+//                // - fallback: GGML_METAL_Q4K_*
+//                const char * env_q4k_nsg =
+//                    ggml_metal_getenv_phase_pref_(is_decode_like,
+//                                                  "GGML_METAL_DECODE_Q4K_NSG",
+//                                                  "GGML_METAL_PP_Q4K_NSG",
+//                                                  "GGML_METAL_Q4K_NSG");
+//                const char * env_q4k_nr0 =
+//                    ggml_metal_getenv_phase_pref_(is_decode_like,
+//                                                  "GGML_METAL_DECODE_Q4K_NR0",
+//                                                  "GGML_METAL_PP_Q4K_NR0",
+//                                                  "GGML_METAL_Q4K_NR0");
+//                
+//                if (env_q4k_nsg && env_q4k_nsg[0]) {
+//                    const int v = atoi(env_q4k_nsg);
+//                    if (v >= 1 && v <= 8) {
+//                        nsg = v;
+//                    }
+//                }
+//                
+//                if (env_q4k_nr0 && env_q4k_nr0[0]) {
+//                    const int v_req = atoi(env_q4k_nr0);
+//                    // Only values with dedicated entry points should be selected.
+//                    // If the user asks something else, clamp down to the nearest allowed <= request.
+//                    const int v = ggml_metal_nr0_allowed_leq_(v_req);
+//                    if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+//                        nr0 = v;
+//                    }
+//                }
+//                
+//                // Safety clamp: avoid invalid (ne00 < nsg*nr0) combos that would select a kernel
+//                // specialization incompatible with the actual problem size (common with tiny heads).
+//                // Keep behavior consistent with Q6_K: clamp NR0 down to the nearest allowed <= (ne00/nsg).
+//                if (nsg < 1) nsg = 1;
+//                if (nr0 < 2) nr0 = 2;
+//                const int max_nr0 = (int) (ne00 / nsg);
+//                if (max_nr0 >= 2) {
+//                    const int nr0_clamped = ggml_metal_nr0_allowed_leq_(max_nr0);
+//                    if (nr0 > nr0_clamped) {
+//                        nr0 = nr0_clamped;
+//                    }
+//                } else {
+//                    // Degenerate: force a minimal safe config.
+//                    nsg = 1;
+//                    nr0 = 2;
+//                }
+//            } break;
+//        case GGML_TYPE_Q5_K:
+//            {
+//                nsg = N_SG_Q5_K;
+//                nr0 = N_R0_Q5_K;
+//            } break;
+//        case GGML_TYPE_Q6_K:
+//            {
+//                nsg = N_SG_Q6_K;
+//                nr0 = N_R0_Q6_K;
+//                // Phase-aware overrides for Q6_K mul_mv:
+//                // - decode-like: GGML_METAL_DECODE_Q6K_*
+//                // - PP/non-decode: GGML_METAL_PP_Q6K_*
+//                // - fallback: GGML_METAL_Q6K_*
+//                const char * env_q6k_nsg =
+//                    ggml_metal_getenv_phase_pref_(is_decode_like,
+//                                                  "GGML_METAL_DECODE_Q6K_NSG",
+//                                                  "GGML_METAL_PP_Q6K_NSG",
+//                                                  "GGML_METAL_Q6K_NSG");
+//                if (env_q6k_nsg) {
+//                    const int v = atoi(env_q6k_nsg);
+//                    if (v >= 1 && v <= 8) {
+//                        nsg = v;
+//                    }
+//                }
+//                
+//                // Optional override: rows per threadgroup for Q6_K mat-vec.
+//                // NOTE: NR0 is compile-time in the Metal kernel. Only values that have a dedicated
+//                // kernel entry point are allowed here.
+//                // Usage:
+//                //   export GGML_METAL_PP_Q6K_NR0=128
+//                //   export GGML_METAL_DECODE_Q6K_NR0=64
+//                const char * env_q6k_nr0 =
+//                    ggml_metal_getenv_phase_pref_(is_decode_like,
+//                                                  "GGML_METAL_DECODE_Q6K_NR0",
+//                                                  "GGML_METAL_PP_Q6K_NR0",
+//                                                  "GGML_METAL_Q6K_NR0");
+//                 if (env_q6k_nr0) {
+//                   const int v = atoi(env_q6k_nr0);
+//                    if (v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+//                        nr0 = v;
+//                    }
+//                    static bool s_logged_q6k_nr0 = false;
+//                    if (!s_logged_q6k_nr0) {
+//                        s_logged_q6k_nr0 = true;
+//                        GGML_LOG_INFO("%s: Q6_K NR0 override = %d", __func__, (int) nr0);
+//                    }
+//                }
+//                
+//                // Safety clamp: avoid invalid (ne00 < nsg*nr0) combos.
+//                if (nsg < 1) {
+//                    nsg = 1;
+//                }
+//                const int max_nr0 = (int) (ne00 / nsg);
+//                if (max_nr0 >= 2) {
+//                    const int nr0_clamped = ggml_metal_nr0_allowed_leq_(max_nr0);
+//                    if (nr0 > nr0_clamped) {
+//                        nr0 = nr0_clamped;
+//                    }
+//                } else {
+//                    nsg = 1;
+//                    nr0 = 2;
+//                }
+//                // Optional visibility: log once when decode-like heuristics triggers.
+//                // This helps validate why GGML_METAL_DECODE_Q6K_* applies.
+//                static bool s_logged_decode_like = false;
+//                if (!s_logged_decode_like && is_decode_like && !is_decode_strict) {
+//                    s_logged_decode_like = true;
+//                    GGML_LOG_INFO("%s: decode-like mul_mv detected (ne11=%d ne12=%d ne13=%d); DECODE_* envs may apply\n",
+//                                  __func__, (int) ne11, (int) ne12, (int) ne13);
+//                }
+//            } break;
+//        case GGML_TYPE_IQ2_XXS:
+//            {
+//                nsg = N_SG_IQ2_XXS;
+//                nr0 = N_R0_IQ2_XXS;
+//                smem = 256*8+128;
+//            } break;
+//        case GGML_TYPE_IQ2_XS:
+//            {
+//                nsg = N_SG_IQ2_XS;
+//                nr0 = N_R0_IQ2_XS;
+//                smem = 512*8+128;
+//            } break;
+//        case GGML_TYPE_IQ3_XXS:
+//            {
+//                nsg = N_SG_IQ3_XXS;
+//                nr0 = N_R0_IQ3_XXS;
+//                smem = 256*4+128;
+//            } break;
+//        case GGML_TYPE_IQ3_S:
+//            {
+//                nsg = N_SG_IQ3_S;
+//                nr0 = N_R0_IQ3_S;
+//                smem = 512*4;
+//            } break;
+//        case GGML_TYPE_IQ2_S:
+//            {
+//                nsg = N_SG_IQ2_S;
+//                nr0 = N_R0_IQ2_S;
+//            } break;
+//        case GGML_TYPE_IQ1_S:
+//            {
+//                nsg = N_SG_IQ1_S;
+//                nr0 = N_R0_IQ1_S;
+//            } break;
+//        case GGML_TYPE_IQ1_M:
+//            {
+//                nsg = N_SG_IQ1_M;
+//                nr0 = N_R0_IQ1_M;
+//            } break;
+//        case GGML_TYPE_IQ4_NL:
+//            {
+//                nsg = N_SG_IQ4_NL;
+//                nr0 = N_R0_IQ4_NL;
+//                smem = 32*sizeof(float);
+//            } break;
+//        case GGML_TYPE_IQ4_XS:
+//            {
+//                nsg = N_SG_IQ4_XS;
+//                nr0 = N_R0_IQ4_XS;
+//                smem = 32*sizeof(float);
+//            } break;
+//        default:
+//            {
+//                GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
+//                GGML_ABORT("not implemented");
+//            }
+//    };
+//
+//    // Q4_K/Q6_K NR0 is compile-time in the Metal kernel entrypoint name. If nr0 differs from
+//    // the default, we MUST pick the specialized entrypoint "_nr0_%d" (no silent fallback).
+//    if (tsrc0 == GGML_TYPE_Q4_K && nr0 != N_R0_Q4_K) {
+//        snprintf(base, 256, "kernel_mul_mv_%s_%s_nr0_%d%s",
+//                 ggml_type_name(tsrc0), ggml_type_name(tsrc1), nr0, suffix);
+//    } else if (tsrc0 == GGML_TYPE_Q6_K && nr0 != N_R0_Q6_K) {
+//        snprintf(base, 256, "kernel_mul_mv_%s_%s_nr0_%d%s",
+//                 ggml_type_name(tsrc0), ggml_type_name(tsrc1), nr0, suffix);
+//    } else {
+//        snprintf(base, 256, "kernel_mul_mv_%s_%s%s",
+//                 ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+//    }
+//
+//    snprintf(name, 256, "%s_nsg=%d", base, nsg);
+//    
+//    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+//    if (!res.pipeline) {
+//        ggml_metal_cv_t cv = ggml_metal_cv_init();
+//
+//        ggml_metal_cv_set_int16(cv, nsg, FC_MUL_MV + 0);
+//
+//        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+//
+//        ggml_metal_cv_free(cv);
+//    }
+//
+//    res.nr0  = nr0;
+//    res.nr1  = nr1;
+//    res.nsg  = nsg;
+//    res.smem = smem;
+//    
+//    // Instrumentation (enable with -lv 4): show the effective base/name + params, and which envs
+//    // were eligible for *this* call (decode-like => DECODE_* takes precedence, else only ANY_*).
+//    if ((tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q6_K) && tsrc1 == GGML_TYPE_F32) {
+//        const char * dec_nsg = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_DECODE_Q4K_NSG") : getenv("GGML_METAL_DECODE_Q6K_NSG");
+//        const char * dec_nr0 = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_DECODE_Q4K_NR0") : getenv("GGML_METAL_DECODE_Q6K_NR0");
+//        const char * pp_nsg  = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_PP_Q4K_NSG")     : getenv("GGML_METAL_PP_Q6K_NSG");
+//        const char * pp_nr0  = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_PP_Q4K_NR0")     : getenv("GGML_METAL_PP_Q6K_NR0");
+//        const char * any_nsg = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_Q4K_NSG")        : getenv("GGML_METAL_Q6K_NSG");
+//        const char * any_nr0 = (tsrc0 == GGML_TYPE_Q4_K) ? getenv("GGML_METAL_Q4K_NR0")        : getenv("GGML_METAL_Q6K_NR0");
+//        // Which envs were eligible for *this* call:
+//        // decode-like => DECODE_* takes precedence, else PP_* takes precedence, then ANY_*.
+//        const char * used_nsg = is_decode_like
+//            ? ((dec_nsg && dec_nsg[0]) ? dec_nsg : any_nsg)
+//            : ((pp_nsg  && pp_nsg [0]) ? pp_nsg  : any_nsg);
+//        const char * used_nr0 = is_decode_like
+//            ? ((dec_nr0 && dec_nr0[0]) ? dec_nr0 : any_nr0)
+//            : ((pp_nr0  && pp_nr0 [0]) ? pp_nr0  : any_nr0);
+//        
+//        GGML_LOG_DEBUG("%s: %s mul_mv select: is_decode=%d base='%s' name='%s' | nr0=%d nr1=%d nsg=%d smem=%zu | used(nsg=%s nr0=%s) | env dec(nsg=%s nr0=%s) pp(nsg=%s nr0=%s) any(nsg=%s nr0=%s)\n",
+//                       __func__,
+//                       tsrc0 == GGML_TYPE_Q4_K ? "Q4_K" : "Q6_K",
+//                       (int) is_decode_like, base, name,
+//                       res.nr0, res.nr1, res.nsg, res.smem,
+//                       used_nsg ? used_nsg : "", used_nr0 ? used_nr0 : "",
+//                       dec_nsg ? dec_nsg : "", dec_nr0 ? dec_nr0 : "",
+//                       pp_nsg ? pp_nsg : "", pp_nr0 ? pp_nr0 : "",
+//                       any_nsg ? any_nsg : "", any_nr0 ? any_nr0 : "");
+//    }
+//    return res;
+//}
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
     char base[256];

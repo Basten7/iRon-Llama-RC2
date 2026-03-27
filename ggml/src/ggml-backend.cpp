@@ -783,6 +783,126 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+static inline int ggml_backend_sched_env_i32_default_(const char * name, int defv) {
+    const char * s = getenv(name);
+    if (s == NULL || s[0] == '\0') {
+        return defv;
+    }
+    return atoi(s);
+}
+
+static inline bool ggml_backend_sched_is_metal_backend_(ggml_backend_t backend) {
+    const char * name = ggml_backend_name(backend);
+    return name != NULL && strcmp(name, "Metal") == 0;
+}
+
+struct ggml_backend_sched_decode_shape_class_ {
+    bool    is_decode_like;
+    bool    is_decode_strict;
+    bool    is_decode_small_mat;
+    bool    is_pp_small_batch;
+    int64_t bs;
+    int64_t aux_batch;
+};
+
+static ggml_backend_sched_decode_shape_class_ ggml_backend_sched_classify_decode_shape_(const ggml_tensor * op) {
+    ggml_backend_sched_decode_shape_class_ cls = {
+        /* .is_decode_like      = */ false,
+        /* .is_decode_strict    = */ false,
+        /* .is_decode_small_mat = */ false,
+        /* .is_pp_small_batch   = */ false,
+        /* .bs                  = */ 0,
+        /* .aux_batch           = */ 1,
+    };
+
+    if (op == NULL) {
+        return cls;
+    }
+
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            cls.bs = op->ne[1];
+            cls.aux_batch = (int64_t) op->ne[2] * (int64_t) op->ne[3];
+            cls.is_decode_like      = (op->ne[1] <= 1);
+            cls.is_decode_strict    = (op->ne[1] == 1 && op->ne[2] == 1 && op->ne[3] == 1);
+            cls.is_decode_small_mat = (op->ne[1] == 1 && cls.aux_batch > 1 && cls.aux_batch <= 8);
+            cls.is_pp_small_batch   = (op->ne[1] > 1 && op->ne[1] <= 8);
+            break;
+        case GGML_OP_MUL_MAT_ID:
+            cls.bs = op->ne[2];
+            cls.aux_batch = (int64_t) op->ne[2] * (int64_t) op->ne[3];
+            cls.is_decode_like      = (op->ne[2] <= 1);
+            cls.is_decode_strict    = (op->ne[2] == 1 && op->ne[3] == 1);
+            cls.is_decode_small_mat = (op->ne[2] == 1 && op->ne[3] > 1 && op->ne[3] <= 8);
+            cls.is_pp_small_batch   = (op->ne[2] > 1 && op->ne[2] <= 8);
+            break;
+        default:
+            break;
+    }
+
+    return cls;
+}
+
+static int ggml_backend_sched_metal_backend_ordinal_(ggml_backend_sched_t sched, int backend_id) {
+    if (backend_id < 0 || backend_id >= sched->n_backends) {
+        return -1;
+    }
+
+    int ordinal = 0;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (!ggml_backend_sched_is_metal_backend_(sched->backends[i])) {
+            continue;
+        }
+        if (i == backend_id) {
+            return ordinal;
+        }
+        ++ordinal;
+    }
+
+    return -1;
+}
+
+static int ggml_backend_sched_active_metal_cap_(ggml_backend_sched_t sched, const ggml_tensor * node) {
+    if (node == NULL) {
+        return 0;
+    }
+
+    const ggml_backend_sched_decode_shape_class_ cls = ggml_backend_sched_classify_decode_shape_(node);
+
+    if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+
+    if (cls.is_decode_like || cls.is_decode_small_mat) {
+        return ggml_backend_sched_env_i32_default_("GGML_METAL_MGPU_MAX_ACTIVE_DEVS_DECODE", 0);
+    }
+
+    if (cls.is_pp_small_batch) {
+        return ggml_backend_sched_env_i32_default_("GGML_METAL_MGPU_MAX_ACTIVE_DEVS_SMALL", 0);
+    }
+
+    return 0;
+}
+
+static bool ggml_backend_sched_backend_allowed_for_node_(ggml_backend_sched_t sched, const ggml_tensor * node, int backend_id) {
+    if (backend_id < 0 || backend_id >= sched->n_backends) {
+        return false;
+    }
+
+    const int active_cap = ggml_backend_sched_active_metal_cap_(sched, node);
+    if (active_cap <= 0) {
+        return true;
+    }
+
+    const int metal_ordinal = ggml_backend_sched_metal_backend_ordinal_(sched, backend_id);
+    if (metal_ordinal < 0) {
+        return true;
+    }
+
+    return metal_ordinal < active_cap;
+}
+
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -827,7 +947,9 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             // check if a backend with higher prio wants to offload the op
             if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                 for (int b = 0; b < src_backend_id; b++) {
-                    if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                    if (!ggml_backend_sched_backend_allowed_for_node_(sched, tensor, b)) {
+                    continue;
+                    }                    if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                         SET_CAUSE(tensor, "1.off");
                         return b;
                     }
@@ -913,6 +1035,9 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
 }
 
 static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, struct ggml_tensor * node, int cur_backend_id, int * node_backend_id) {
+    if (!ggml_backend_sched_backend_allowed_for_node_(sched, node, cur_backend_id)) {
+         return;
+    }
     if (ggml_backend_supports_op(sched->backends[cur_backend_id], node)) {
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
@@ -1074,6 +1199,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // unassigned node: find the backend with the most supported inputs
             int n_supported_best = -1;
             for (int b = 0; b < sched->n_backends; b++) {
+                if (!ggml_backend_sched_backend_allowed_for_node_(sched, node, b)) {
+                    continue;
+                }
                 if (ggml_backend_supports_op(sched->backends[b], node)) {
                     int n_supported = 0;
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -1095,6 +1223,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         } else {
             // assigned node: upgrade to higher prio backend if possible
             for (int b = 0; b < *node_backend_id; b++) {
+                if (!ggml_backend_sched_backend_allowed_for_node_(sched, node, b)) {
+                    continue;
+                }
                 if (sched->bufts[b] == sched->bufts[*node_backend_id] && ggml_backend_supports_op(sched->backends[b], node)) {
                     bool supported = true;
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
