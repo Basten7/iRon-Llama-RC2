@@ -144,6 +144,52 @@ static int ggml_metal_env_mmv_id_dec_nsg(void) {
     return cached;
 }
 
+static int ggml_metal_env_mmv_ext_pp_nsg(void) {
+    static int cached = INT_MIN;
+    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_MMV_EXT_PP_NSG", 0);
+    return cached;
+}
+
+static int ggml_metal_env_mmv_ext_pp_nxpsg(void) {
+    static int cached = INT_MIN;
+    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_MMV_EXT_PP_NXPSG", 0);
+    return cached;
+}
+
+static int ggml_metal_env_mmv_ext_pp_r1ptg(void) {
+    static int cached = INT_MIN;
+    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_MMV_EXT_PP_R1PTG", 0);
+    return cached;
+}
+
+static void ggml_metal_log_mmv_ext_select_(
+        const ggml_tensor * op,
+        const ggml_metal_decode_shape_class_ops_ & cls,
+        int nsg,
+        int nxpsg,
+        int r1ptg,
+        const char * reason) {
+    if (!ggml_metal_mmv_log_enabled()) {
+        return;
+    }
+
+    fprintf(stderr,
+        "ggml-metal mul_mv_ext: op=%s tensor='%s' type=%s bs=%lld aux_batch=%lld decode_like=%d decode_strict=%d decode_small_mat=%d pp_small_batch=%d nsg=%d nxpsg=%d r1ptg=%d reason=%s\n",
+        ggml_op_name(op->op),
+        op->name[0] ? op->name : "(unnamed)",
+        ggml_type_name(op->src[0]->type),
+        (long long) cls.bs,
+        (long long) cls.aux_batch,
+        (int) cls.is_decode_like,
+        (int) cls.is_decode_strict,
+        (int) cls.is_decode_small_mat,
+        (int) cls.is_pp_small_batch,
+        nsg,
+        nxpsg,
+        r1ptg,
+        reason ? reason : "none");
+}
+
 static void ggml_metal_log_mmv_select_(
         const char * fn,
         const ggml_tensor * op,
@@ -1975,7 +2021,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //       my current hypothesis is that the work grid is not evenly divisible for different nsg
         //       values and there can be some tail effects when nsg is high. need to confirm this
         //
-        const int nsg    = 2;                 // num simdgroups per threadgroup
+        int nsg    = 2;                 // num simdgroups per threadgroup
 
         // num threads along row per simdgroup
         int16_t nxpsg = 0;
@@ -1987,9 +2033,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             nxpsg = 4;
         }
 
-        const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
-        const int16_t r0ptg  = nypsg*nsg;         // num src0 rows per threadgroup
-              int16_t r1ptg  = 4;                 // num src1 rows per threadgroup
+        int16_t r1ptg  = 4;                 // num src1 rows per threadgroup
 
         // note: not sure how optimal are those across all different hardware. there might be someting cleverer
         switch (ne11) {
@@ -2007,6 +2051,39 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             default:
                 GGML_ABORT("unsupported ne11");
         };
+
+        const bool use_ext_pp_override = !cls.is_decode_like && cls.is_pp_small_batch;
+        if (use_ext_pp_override) {
+            const int env_nsg   = ggml_metal_env_mmv_ext_pp_nsg();
+            const int env_nxpsg = ggml_metal_env_mmv_ext_pp_nxpsg();
+            const int env_r1ptg = ggml_metal_env_mmv_ext_pp_r1ptg();
+
+            if (env_nsg > 0) {
+                nsg = env_nsg;
+            }
+            if (env_nxpsg == 4 || env_nxpsg == 8 || env_nxpsg == 16) {
+                nxpsg = (int16_t) env_nxpsg;
+            }
+            if (env_r1ptg > 0) {
+                r1ptg = (int16_t) env_r1ptg;
+            }
+        }
+
+        GGML_ASSERT(nxpsg > 0);
+        GGML_ASSERT(32 % nxpsg == 0);
+        GGML_ASSERT(nsg > 0);
+        GGML_ASSERT(r1ptg > 0);
+
+        const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
+        const int16_t r0ptg  = nypsg*nsg;         // num src0 rows per threadgroup
+
+        ggml_metal_log_mmv_ext_select_(
+            op,
+            cls,
+            nsg,
+            nxpsg,
+            r1ptg,
+            use_ext_pp_override ? "pp-small-batch-override" : "pipeline-default");
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op->src[0]->type, op->src[1]->type, nsg, nxpsg, r1ptg);
 
