@@ -4,6 +4,7 @@
 #include <Metal/Metal.h>
 #include <stdatomic.h>
 #include <dispatch/dispatch.h>
+#include <objc/message.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -583,6 +584,158 @@ struct ggml_metal_device {
     size_t vram_private_budget;
     size_t vram_private_allocated;
 };
+
+//
+// Shared-event wrapper (native Metal cross-device events)
+//
+
+struct ggml_metal_shared_event {
+    ggml_metal_device_t owner_dev;
+    id<MTLSharedEvent> owner_event;
+    MTLSharedEventHandle * handle;
+    NSMutableDictionary * imported_events;
+    NSLock * lock;
+    uint64_t value;
+};
+
+typedef struct ggml_metal_shared_event * ggml_metal_shared_event_t;
+
+bool ggml_metal_device_supports_shared_events(ggml_metal_device_t dev);
+ggml_metal_shared_event_t ggml_metal_shared_event_new(ggml_metal_device_t dev);
+void ggml_metal_shared_event_free(ggml_metal_shared_event_t ev);
+bool ggml_metal_shared_event_record(ggml_metal_shared_event_t ev, ggml_metal_device_t dev);
+bool ggml_metal_shared_event_wait(ggml_metal_shared_event_t ev, ggml_metal_device_t dev);
+bool ggml_metal_shared_event_synchronize(ggml_metal_shared_event_t ev);
+
+bool ggml_metal_device_supports_shared_events(ggml_metal_device_t dev) {
+    if (!dev || !dev->mtl_device || !dev->mtl_queue) return false;
+#if TARGET_OS_OSX || TARGET_OS_IOS || TARGET_OS_TV || TARGET_OS_VISION
+    if (@available(macOS 10.14, iOS 12.0, tvOS 12.0, visionOS 1.0, *)) {
+        return [dev->mtl_device respondsToSelector:NSSelectorFromString(@"newSharedEvent")];
+    }
+#endif
+    return false;
+}
+
+static id<MTLSharedEvent> ggml_metal_shared_event_import_for_device_locked_(ggml_metal_shared_event_t ev, ggml_metal_device_t dev) {
+    if (!ev || !dev) return nil;
+    if (dev == ev->owner_dev) return ev->owner_event;
+    NSValue * key = [NSValue valueWithPointer:dev];
+    id<MTLSharedEvent> imported = (id<MTLSharedEvent>)[ev->imported_events objectForKey:key];
+    if (imported != nil) return imported;
+    if (ev->handle == nil) return nil;
+    SEL sel = NSSelectorFromString(@"newSharedEventWithHandle:");
+    if (![dev->mtl_device respondsToSelector:sel]) return nil;
+    id imported_new = ((id (*)(id, SEL, id)) objc_msgSend)(dev->mtl_device, sel, ev->handle);
+    if (imported_new == nil) return nil;
+    [ev->imported_events setObject:imported_new forKey:key];
+    [imported_new release];
+    return (id<MTLSharedEvent>)[ev->imported_events objectForKey:key];
+}
+
+ggml_metal_shared_event_t ggml_metal_shared_event_new(ggml_metal_device_t dev) {
+    if (!ggml_metal_device_supports_shared_events(dev)) return NULL;
+#if TARGET_OS_OSX || TARGET_OS_IOS || TARGET_OS_TV || TARGET_OS_VISION
+    if (@available(macOS 10.14, iOS 12.0, tvOS 12.0, visionOS 1.0, *)) {
+        SEL sel_new = NSSelectorFromString(@"newSharedEvent");
+        if (![dev->mtl_device respondsToSelector:sel_new]) return NULL;
+        id owner_event = ((id (*)(id, SEL)) objc_msgSend)(dev->mtl_device, sel_new);
+        if (owner_event == nil) return NULL;
+        MTLSharedEventHandle * handle = nil;
+        SEL sel_handle = NSSelectorFromString(@"newSharedEventHandle");
+        if ([owner_event respondsToSelector:sel_handle]) {
+            handle = ((id (*)(id, SEL)) objc_msgSend)(owner_event, sel_handle);
+        }
+        ggml_metal_shared_event_t ev = (ggml_metal_shared_event_t) calloc(1, sizeof(struct ggml_metal_shared_event));
+        if (!ev) { if (handle) [handle release]; [owner_event release]; return NULL; }
+        ev->owner_dev = dev;
+        ev->owner_event = (id<MTLSharedEvent>) owner_event;
+        ev->handle = handle;
+        ev->imported_events = [[NSMutableDictionary alloc] init];
+        ev->lock = [NSLock new];
+        ev->value = 0;
+        return ev;
+    }
+#endif
+    return NULL;
+}
+
+void ggml_metal_shared_event_free(ggml_metal_shared_event_t ev) {
+    if (!ev) return;
+    [ev->imported_events release];
+    if (ev->handle) [ev->handle release];
+    if (ev->owner_event) [ev->owner_event release];
+    if (ev->lock) [ev->lock release];
+    free(ev);
+}
+
+static bool ggml_metal_shared_event_encode_(ggml_metal_shared_event_t ev, ggml_metal_device_t dev, bool is_wait, uint64_t * value_io) {
+    if (!ev || !dev || !value_io) return false;
+    if (!ggml_metal_device_supports_shared_events(dev)) return false;
+#if TARGET_OS_OSX || TARGET_OS_IOS || TARGET_OS_TV || TARGET_OS_VISION
+    if (@available(macOS 10.14, iOS 12.0, tvOS 12.0, visionOS 1.0, *)) {
+        // ok
+    } else {
+        return false;
+    }
+#endif
+    [ev->lock lock];
+    uint64_t value = *value_io;
+    if (!is_wait) { value = ++ev->value; *value_io = value; }
+    id<MTLSharedEvent> mtl_event = ggml_metal_shared_event_import_for_device_locked_(ev, dev);
+    if (mtl_event != nil) [mtl_event retain];
+    [ev->lock unlock];
+    if (mtl_event == nil) return false;
+    id<MTLCommandBuffer> cmd_buf = [dev->mtl_queue commandBufferWithUnretainedReferences];
+    if (cmd_buf == nil) { [mtl_event release]; return false; }
+    if (is_wait) {
+        ((void (*)(id, SEL, id, uint64_t)) objc_msgSend)(cmd_buf, NSSelectorFromString(@"encodeWaitForEvent:value:"), mtl_event, value);
+    } else {
+        ((void (*)(id, SEL, id, uint64_t)) objc_msgSend)(cmd_buf, NSSelectorFromString(@"encodeSignalEvent:value:"), mtl_event, value);
+    }
+    [cmd_buf commit];
+    [mtl_event release];
+    return true;
+}
+
+bool ggml_metal_shared_event_record(ggml_metal_shared_event_t ev, ggml_metal_device_t dev) {
+    uint64_t value = 0;
+    return ggml_metal_shared_event_encode_(ev, dev, false, &value);
+}
+
+bool ggml_metal_shared_event_wait(ggml_metal_shared_event_t ev, ggml_metal_device_t dev) {
+    if (!ev || !dev) return false;
+    [ev->lock lock];
+    uint64_t value = ev->value;
+    [ev->lock unlock];
+    if (value == 0) return true;
+    return ggml_metal_shared_event_encode_(ev, dev, true, &value);
+}
+
+bool ggml_metal_shared_event_synchronize(ggml_metal_shared_event_t ev) {
+    if (!ev || !ev->owner_dev) return false;
+    [ev->lock lock];
+    const uint64_t value = ev->value;
+    id<MTLSharedEvent> owner_event = ev->owner_event;
+    if (owner_event != nil) [owner_event retain];
+    [ev->lock unlock];
+    if (value == 0 || owner_event == nil) { if (owner_event) [owner_event release]; return true; }
+#if TARGET_OS_OSX || TARGET_OS_IOS || TARGET_OS_TV || TARGET_OS_VISION
+    if (@available(macOS 10.14, iOS 12.0, tvOS 12.0, visionOS 1.0, *)) {
+        // ok
+    } else {
+        [owner_event release];
+        return false;
+    }
+#endif
+    id<MTLCommandBuffer> cmd_buf = [ev->owner_dev->mtl_queue commandBufferWithUnretainedReferences];
+    if (cmd_buf == nil) { [owner_event release]; return false; }
+    ((void (*)(id, SEL, id, uint64_t)) objc_msgSend)(cmd_buf, NSSelectorFromString(@"encodeWaitForEvent:value:"), owner_event, value);
+    [cmd_buf commit];
+    [cmd_buf waitUntilCompleted];
+    [owner_event release];
+    return true;
+}
 
 //
 // MTLResidenceSet wrapper

@@ -323,13 +323,106 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
     buf->iface.memset_tensor(buf, tensor, value, offset, size);
 }
 
-void ggml_backend_synchronize(ggml_backend_t backend) {
-    GGML_ASSERT(backend);
-    if (backend->iface.synchronize == NULL) {
+
+static inline bool ggml_backend_trace_copy_enabled_() {
+    const char * s = getenv("GGML_METAL_MGPU_TRACE_COPY");
+    return s != NULL && s[0] != '\0' && atoi(s) != 0;
+}
+
+
+static inline bool ggml_backend_sched_moe_sparse_stats_enabled_(void) {
+    const char * s = getenv("GGML_SCHED_MOE_SPARSE_STATS");
+    return s != NULL && s[0] != '\0' && atoi(s) != 0;
+}
+
+struct ggml_backend_sched_moe_sparse_stats_ {
+    int64_t candidates;
+    int64_t sparse_inputs;
+    int64_t ids_fetches;
+    int64_t input_backend_syncs;
+    int64_t ids_backend_syncs;
+    int64_t expert_ranges_copied;
+    int64_t experts_copied;
+    int64_t bytes_copied;
+    int64_t skipped_not_host;
+    int64_t skipped_other;
+};
+
+static inline void ggml_backend_sched_log_moe_sparse_stats_(
+        const ggml_backend_sched_moe_sparse_stats_ * st) {
+    if (!ggml_backend_sched_moe_sparse_stats_enabled_() || st == NULL) {
         return;
     }
 
+    GGML_LOG_INFO(
+        "ggml-backend: moe-sparse-stats: candidates=%lld sparse_inputs=%lld ids_fetches=%lld input_syncs=%lld ids_syncs=%lld ranges=%lld experts=%lld bytes=%lld skipped_not_host=%lld skipped_other=%lld\n",
+        (long long) st->candidates,
+        (long long) st->sparse_inputs,
+        (long long) st->ids_fetches,
+        (long long) st->input_backend_syncs,
+        (long long) st->ids_backend_syncs,
+        (long long) st->expert_ranges_copied,
+        (long long) st->experts_copied,
+        (long long) st->bytes_copied,
+        (long long) st->skipped_not_host,
+        (long long) st->skipped_other);
+}
+
+static inline void ggml_backend_trace_sync_(
+        const char * stage,
+        ggml_backend_t backend,
+        const char * extra) {
+    if (!ggml_backend_trace_copy_enabled_()) {
+        return;
+    }
+
+    GGML_LOG_DEBUG(
+        "%s: stage=%s backend=%s backend_ptr=%p context_ptr=%p extra=%s\n",
+        __func__,
+        stage ? stage : "",
+        backend ? ggml_backend_name(backend) : "",
+        (void *) backend,
+        backend ? backend->context : NULL,
+        extra ? extra : "");
+}
+
+static inline void ggml_backend_trace_copy_(
+        const char * stage,
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        const struct ggml_tensor * src,
+        const struct ggml_tensor * dst,
+        size_t nbytes,
+        const char * extra) {
+    if (!ggml_backend_trace_copy_enabled_()) {
+        return;
+    }
+
+    GGML_LOG_DEBUG(
+        "%s: stage=%s src_backend=%s src_backend_ptr=%p src_context_ptr=%p dst_backend=%s dst_backend_ptr=%p dst_context_ptr=%p src='%s' dst='%s' bytes=%zu extra=%s\n",
+        __func__,
+        stage ? stage : "",
+        backend_src ? ggml_backend_name(backend_src) : "",
+        (void *) backend_src,
+        backend_src ? backend_src->context : NULL,
+        backend_dst ? ggml_backend_name(backend_dst) : "",
+        (void *) backend_dst,
+        backend_dst ? backend_dst->context : NULL,
+        src ? src->name : "",
+        dst ? dst->name : "",
+        nbytes,
+        extra ? extra : "");
+}
+
+void ggml_backend_synchronize(ggml_backend_t backend) {
+    GGML_ASSERT(backend);
+    if (backend->iface.synchronize == NULL) {
+        ggml_backend_trace_sync_("sync.skip", backend, "iface-null");
+        return;
+    }
+    ggml_backend_trace_sync_("sync.enter", backend, "dispatch");
     backend->iface.synchronize(backend);
+    ggml_backend_trace_sync_("sync.exit", backend, "done");
 }
 
 ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -825,37 +918,6 @@ static inline void ggml_backend_sched_trace_copy_(
         extra ? extra : "");
 }
 
-static inline int ggml_backend_sched_env_dense_mul_mat_weight_reuse_min_inputs_() {
-    const char * v = getenv("GGML_SCHED_DENSE_MUL_MAT_WEIGHT_REUSE_MIN_INPUTS");
-    if (v == NULL || v[0] == '\0') {
-        return -1;
-    }
-
-    const int x = atoi(v);
-    return x < 0 ? -1 : x;
-}
-
-static inline bool ggml_backend_sched_can_delay_weight_split_for_dense_mul_mat_(
-        const struct ggml_tensor * node,
-        int split_n_inputs) {
-    const int min_inputs = ggml_backend_sched_env_dense_mul_mat_weight_reuse_min_inputs_();
-    if (min_inputs <= 0 || node == NULL || node->op != GGML_OP_MUL_MAT) {
-        return false;
-    }
-
-    const int64_t bs        = node->ne[1];
-    const int64_t aux_batch = (int64_t) node->ne[2] * (int64_t) node->ne[3];
-    const bool is_decode_like = (bs <= 1);
-
-    // Keep decode-like and tiny PP on the conservative path.
-    if (is_decode_like || bs < 16) {
-        return false;
-    }
-
-    GGML_UNUSED(aux_batch);
-    return split_n_inputs < min_inputs;
-}
-
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -1262,9 +1324,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
-                            if (ggml_backend_sched_can_delay_weight_split_for_dense_mul_mat_(node, split->n_inputs)) {
-                                continue;
-                            }
                             need_new_split = true;
                             break;
                         }
@@ -1520,9 +1579,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    ggml_backend_sched_moe_sparse_stats_ moe_sparse_stats = {
+        /* .candidates           = */ 0,
+        /* .sparse_inputs        = */ 0,
+        /* .ids_fetches          = */ 0,
+        /* .input_backend_syncs  = */ 0,
+        /* .ids_backend_syncs    = */ 0,
+        /* .expert_ranges_copied = */ 0,
+        /* .experts_copied       = */ 0,
+        /* .bytes_copied         = */ 0,
+        /* .skipped_not_host     = */ 0,
+        /* .skipped_other        = */ 0,
+    };
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    std::vector<uint8_t> moe_copy_tmp;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1554,17 +1627,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+                // this is especially important for MGPU MoE when weights may live on another Metal backend:
+                // in that case we still want sparse expert copies, not a full weight-tensor copy.
                 ggml_tensor * node = split->graph.nodes[0];
-                if (split->graph.n_nodes > 0 &&
-                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input->buffer) && (
+                const bool is_moe_weight_candidate =
+                    split->graph.n_nodes > 0 &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && (
                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
-                    )) {
+                    );
+                if (is_moe_weight_candidate) {
 
+                    const bool input_is_host = ggml_backend_buffer_is_host(input->buffer);
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
+                    moe_sparse_stats.sparse_inputs++;
+                    moe_sparse_stats.input_backend_syncs++;
                     ggml_backend_synchronize(input_backend);
 
                     // get the ids
@@ -1583,7 +1662,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                        moe_sparse_stats.ids_fetches++;
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                        moe_sparse_stats.ids_backend_syncs++;
                         ggml_backend_synchronize(ids_backend);
 
                         // find the used experts
@@ -1606,13 +1687,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                        const size_t copy_bytes = expert_size_copy + padding_end;
 
-                        ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                        if (input_is_host) {
+                            ggml_backend_tensor_set_async(split_backend,
+                                input_cpy,
+                                (const uint8_t *)input->data + expert_offset, expert_offset,
+                                // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                                // this is necessary for MMQ in the CUDA backend
+                                copy_bytes);
+                        } else {
+                            moe_copy_tmp.resize(copy_bytes);
+                            ggml_backend_tensor_get(input, moe_copy_tmp.data(), expert_offset, copy_bytes);
+                            ggml_backend_tensor_set_async(split_backend,
+                                input_cpy,
+                                moe_copy_tmp.data(), expert_offset,
+                                copy_bytes);
+                        }
                     };
 
                     int id = 0;
@@ -1639,6 +1730,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
+                    if (is_moe_weight_candidate) {
+                        if (!ggml_backend_buffer_is_host(input->buffer)) {
+                            moe_sparse_stats.skipped_not_host++;
+                        } else {
+                            moe_sparse_stats.skipped_other++;
+                        }
+                    }
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     const bool has_async = split_backend->iface.cpy_tensor_async != NULL;
@@ -1664,6 +1762,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_log_moe_sparse_stats_(&moe_sparse_stats);
                 return ec;
             }
         } else {
@@ -1686,6 +1785,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    ggml_backend_sched_log_moe_sparse_stats_(&moe_sparse_stats);
                     return ec;
                 }
 
@@ -1708,6 +1808,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    ggml_backend_sched_log_moe_sparse_stats_(&moe_sparse_stats);
     return GGML_STATUS_SUCCESS;
 }
 

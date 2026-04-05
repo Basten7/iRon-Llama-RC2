@@ -6,6 +6,7 @@
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
 #include <vector>
+#include <array>
 #include <string>
 #include <cstdio>
 #include <mutex>
@@ -251,15 +252,6 @@ static int64_t ggml_metal_mul_mat_work_m_(const ggml_tensor * op) {
     return (K * N * M) / 1000000;
 }
 
-static int ggml_backend_metal_env_n_cb_(void) {
-    const char * v = getenv("GGML_METAL_N_CB");
-    if (v == NULL || v[0] == '\0') {
-        return 1;
-    }
-
-    const int n = atoi(v);
-    return n > 0 ? n : 1;
-}
 // initialized in ggml_backend_metal_reg
 static ggml_backend_reg g_ggml_metal_reg;
 
@@ -720,11 +712,69 @@ static const char * ggml_backend_metal_name(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+struct ggml_backend_metal_staging_slot_ {
+    std::vector<uint8_t> data;
+    ggml_metal_t pending_ctx = NULL;
+    bool in_flight = false;
+};
+
+struct ggml_backend_metal_staging_pool_ {
+    static constexpr size_t SLOT_COUNT = 8;
+    std::array<ggml_backend_metal_staging_slot_, SLOT_COUNT> slots;
+    size_t next_slot = 0;
+};
+
+static thread_local ggml_backend_metal_staging_pool_ g_ggml_backend_metal_staging_pool_;
+
+static bool ggml_backend_metal_flush_staging_ctx_(ggml_metal_t ctx) {
+    if (ctx == NULL) {
+        return false;
+    }
+
+    bool has_pending = false;
+    for (auto & slot : g_ggml_backend_metal_staging_pool_.slots) {
+        if (slot.in_flight && slot.pending_ctx == ctx) {
+            has_pending = true;
+            break;
+        }
+    }
+
+    if (!has_pending) {
+        return false;
+    }
+
+    ggml_metal_synchronize(ctx);
+    for (auto & slot : g_ggml_backend_metal_staging_pool_.slots) {
+        if (slot.pending_ctx == ctx) {
+            slot.in_flight = false;
+            slot.pending_ctx = NULL;
+        }
+    }
+
+    return true;
+}
+
+static ggml_backend_metal_staging_slot_ & ggml_backend_metal_acquire_staging_slot_(void) {
+    auto & pool = g_ggml_backend_metal_staging_pool_;
+    auto & slot = pool.slots[pool.next_slot];
+    pool.next_slot = (pool.next_slot + 1) % ggml_backend_metal_staging_pool_::SLOT_COUNT;
+
+    if (slot.in_flight && slot.pending_ctx != NULL) {
+        ggml_metal_synchronize(slot.pending_ctx);
+        slot.in_flight = false;
+        slot.pending_ctx = NULL;
+    }
+
+    return slot;
+}
+
 static void ggml_backend_metal_free(ggml_backend_t backend) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
     // wait for any ongoing async operations to finish
-    ggml_metal_synchronize(ctx);
+    if (!ggml_backend_metal_flush_staging_ctx_(ctx)) {
+        ggml_metal_synchronize(ctx);
+    }
 
     ggml_metal_free(ctx);
 
@@ -734,7 +784,9 @@ static void ggml_backend_metal_free(ggml_backend_t backend) {
 static void ggml_backend_metal_synchronize(ggml_backend_t backend) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
-    ggml_metal_synchronize(ctx);
+    if (!ggml_backend_metal_flush_staging_ctx_(ctx)) {
+        ggml_metal_synchronize(ctx);
+    }
 }
 
 static void ggml_backend_metal_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -798,8 +850,11 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
         return false;
     }
     
-    std::vector<uint8_t> tmp;
-    tmp.resize(nbytes);
+    auto & slot = ggml_backend_metal_acquire_staging_slot_();
+    if (slot.data.size() < nbytes) {
+        slot.data.resize(nbytes);
+    }
+    uint8_t * tmp = slot.data.data();
     
     // --- src -> host ---
     if (src_is_metal) {
@@ -807,12 +862,12 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
         if (ctx_src == NULL) {
             return false;
         }
-        ggml_metal_get_tensor_async(ctx_src, src, tmp.data(), 0, nbytes);
+        ggml_metal_get_tensor_async(ctx_src, src, tmp, 0, nbytes);
         ggml_backend_metal_trace_copy_("cpy.src-sync", backend_src, backend_dst, src, dst, nbytes, "src-metal-to-host");
         ggml_metal_synchronize(ctx_src);
     } else {
         // src is non-Metal (CPU): use generic backend getter
-        ggml_backend_tensor_get(src, tmp.data(), 0, nbytes);
+        ggml_backend_tensor_get(src, tmp, 0, nbytes);
     }
     
     // --- host -> dst ---
@@ -821,12 +876,15 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
         if (ctx_dst == NULL) {
             return false;
         }
-        ggml_metal_set_tensor_async(ctx_dst, dst, tmp.data(), 0, nbytes);
-        ggml_backend_metal_trace_copy_("cpy.dst-sync", backend_src, backend_dst, src, dst, nbytes, "host-to-dst-metal");
-        ggml_metal_synchronize(ctx_dst);
+        ggml_metal_set_tensor_async(ctx_dst, dst, tmp, 0, nbytes);
+        ggml_backend_metal_trace_copy_("cpy.dst-deferred", backend_src, backend_dst, src, dst, nbytes, "host-to-dst-metal");
+        slot.pending_ctx = ctx_dst;
+        slot.in_flight = true;
     } else {
         // dst is non-Metal (CPU): use generic backend setter
-        ggml_backend_tensor_set(dst, tmp.data(), 0, nbytes);
+        ggml_backend_tensor_set(dst, tmp, 0, nbytes);
+        slot.pending_ctx = NULL;
+        slot.in_flight = false;
     }
     
     ggml_backend_metal_trace_copy_("cpy.end", backend_src, backend_dst, src, dst, nbytes, "ok");
@@ -852,6 +910,16 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
 
     ggml_metal_set_n_cb(ctx, n_cb);
 
+}
+
+static int ggml_backend_metal_env_n_cb_(void) {
+    const char * v = getenv("GGML_METAL_N_CB");
+    if (v == NULL || v[0] == '\0') {
+        return 1;
+    }
+
+    const int n = atoi(v);
+    return n > 0 ? n : 1;
 }
 
 static ggml_backend_i ggml_backend_metal_i = {
@@ -1044,7 +1112,7 @@ static ggml_backend_t ggml_backend_metal_device_init(ggml_backend_dev_t dev, con
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_env_n_cb_());
+    ggml_backend_metal_set_n_cb(backend, 1);
 
     return backend;
 
@@ -1230,28 +1298,7 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
             small_mat_override = true;
         }
     }
-
-    // MGPU selective guard for dense PP MUL_MAT only.
-    // Keep decode / small-mat / MoE paths unchanged.
-    if (is_mgpu &&
-        op->op == GGML_OP_MUL_MAT &&
-        !cls.is_decode_like &&
-        !cls.is_decode_strict &&
-        !cls.is_decode_small_mat &&
-        !small_mat_override) {
-        if (pp_dense_mul_mat_min_bs >= 0 && bs < pp_dense_mul_mat_min_bs) {
-            ggml_metal_log_offload_decision_(dev, op, bs, false, "mgpu-pp-dense-mul_mat-min-bs");
-            return false;
-        }
-
-        if (pp_dense_mul_mat_min_work_m >= 0 &&
-            mul_mat_work_m >= 0 &&
-            mul_mat_work_m < pp_dense_mul_mat_min_work_m) {
-            ggml_metal_log_offload_decision_(dev, op, bs, false, "mgpu-pp-dense-mul_mat-min-work");
-            return false;
-        }
-    }
-
+    
     if (ggml_metal_env_offload_debug_()) {
         fprintf(stderr,
             "ggml-metal offload-threshold: dev='%s' op=%s tensor='%s' bs=%lld offload_min_bs=%lld effective_offload_min_bs=%lld is_mgpu=%d is_decode_like=%d is_decode_strict=%d is_decode_small_mat=%d is_pp_small_batch=%d aux_batch=%lld small_mat_offload_max_bs=%d small_mat_override=%d\n",
