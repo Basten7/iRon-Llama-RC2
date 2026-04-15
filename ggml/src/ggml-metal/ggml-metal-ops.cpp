@@ -64,6 +64,36 @@ static bool ggml_metal_fa_log_enabled(void) {
     if (cached == -2) cached = ggml_metal_env_tri("GGML_METAL_FA_LOG", 0);
     return cached == 1;
 }
+
+static int ggml_metal_env_fa_tiled_nsg(void) {
+    static int cached = INT_MIN;
+    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_FA_TILED_NSG", 0);
+    return cached;
+}
+
+static int ggml_metal_env_fa_vec_nsg(void) {
+    static int cached = INT_MIN;
+    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_FA_VEC_NSG", 0);
+    return cached;
+}
+
+static int ggml_metal_env_fa_vec_nwg(void) {
+    static int cached = INT_MIN;
+    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_FA_VEC_NWG", 0);
+    return cached;
+}
+
+static bool ggml_metal_env_fa_amd_vec_relax(void) {
+    static int cached = -2;
+    if (cached == -2) cached = ggml_metal_env_tri("GGML_METAL_FA_AMD_VEC_RELAX", 0);
+    return cached == 1;
+}
+
+static bool ggml_metal_env_fa_vec_allow_kvpad(void) {
+    static int cached = -2;
+    if (cached == -2) cached = ggml_metal_env_tri("GGML_METAL_FA_VEC_ALLOW_KVPAD", 0);
+    return cached == 1;
+}
 //TOTO
 static bool ggml_metal_mmv_log_enabled(void) {
     static int cached = -2;
@@ -144,50 +174,173 @@ static int ggml_metal_env_mmv_id_dec_nsg(void) {
     return cached;
 }
 
-static int ggml_metal_env_mmv_ext_pp_nsg(void) {
-    static int cached = INT_MIN;
-    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_MMV_EXT_PP_NSG", 0);
-    return cached;
+static const char * ggml_metal_type_env_name_(ggml_type type, bool is_decode_like, bool is_id, bool want_nsg) {
+    switch (type) {
+        case GGML_TYPE_F32:
+            if (is_id) {
+                return is_decode_like ? (want_nsg ? "GGML_METAL_DECODE_F32_ID_NSG" : "GGML_METAL_DECODE_F32_ID_NR0")
+                                      : (want_nsg ? "GGML_METAL_PP_F32_ID_NSG"     : "GGML_METAL_PP_F32_ID_NR0");
+            }
+            return is_decode_like ? (want_nsg ? "GGML_METAL_DECODE_F32_NSG" : "GGML_METAL_DECODE_F32_NR0")
+                                  : (want_nsg ? "GGML_METAL_PP_F32_NSG"     : "GGML_METAL_PP_F32_NR0");
+        case GGML_TYPE_F16:
+            if (is_id) {
+                return is_decode_like ? (want_nsg ? "GGML_METAL_DECODE_F16_ID_NSG" : "GGML_METAL_DECODE_F16_ID_NR0")
+                                      : (want_nsg ? "GGML_METAL_PP_F16_ID_NSG"     : "GGML_METAL_PP_F16_ID_NR0");
+            }
+            return is_decode_like ? (want_nsg ? "GGML_METAL_DECODE_F16_NSG" : "GGML_METAL_DECODE_F16_NR0")
+                                  : (want_nsg ? "GGML_METAL_PP_F16_NSG"     : "GGML_METAL_PP_F16_NR0");
+        case GGML_TYPE_BF16:
+            if (is_id) {
+                return is_decode_like ? (want_nsg ? "GGML_METAL_DECODE_BF16_ID_NSG" : "GGML_METAL_DECODE_BF16_ID_NR0")
+                                      : (want_nsg ? "GGML_METAL_PP_BF16_ID_NSG"     : "GGML_METAL_PP_BF16_ID_NR0");
+            }
+            return is_decode_like ? (want_nsg ? "GGML_METAL_DECODE_BF16_NSG" : "GGML_METAL_DECODE_BF16_NR0")
+                                  : (want_nsg ? "GGML_METAL_PP_BF16_NSG"     : "GGML_METAL_PP_BF16_NR0");
+        default:
+            return nullptr;
+    }
 }
 
-static int ggml_metal_env_mmv_ext_pp_nxpsg(void) {
-    static int cached = INT_MIN;
-    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_MMV_EXT_PP_NXPSG", 0);
-    return cached;
+static const char * ggml_metal_type_env_fallback_name_(ggml_type type, bool want_nsg) {
+    switch (type) {
+        case GGML_TYPE_F32:  return want_nsg ? "GGML_METAL_F32_NSG"  : "GGML_METAL_F32_NR0";
+        case GGML_TYPE_F16:  return want_nsg ? "GGML_METAL_F16_NSG"  : "GGML_METAL_F16_NR0";
+        case GGML_TYPE_BF16: return want_nsg ? "GGML_METAL_BF16_NSG" : "GGML_METAL_BF16_NR0";
+        default:             return nullptr;
+    }
 }
 
-static int ggml_metal_env_mmv_ext_pp_r1ptg(void) {
-    static int cached = INT_MIN;
-    if (cached == INT_MIN) cached = ggml_metal_env_int("GGML_METAL_MMV_EXT_PP_R1PTG", 0);
-    return cached;
-}
-
-static void ggml_metal_log_mmv_ext_select_(
-        const ggml_tensor * op,
-        const ggml_metal_decode_shape_class_ops_ & cls,
-        int nsg,
-        int nxpsg,
-        int r1ptg,
-        const char * reason) {
-    if (!ggml_metal_mmv_log_enabled()) {
-        return;
+static int ggml_metal_env_type_phase_int_(ggml_type type, bool is_decode_like, bool is_id, bool want_nsg) {
+    const char * primary = ggml_metal_type_env_name_(type, is_decode_like, is_id, want_nsg);
+    if (primary) {
+        const int v = ggml_metal_env_int(primary, INT_MIN);
+        if (v != INT_MIN) {
+            return v;
+        }
     }
 
-    fprintf(stderr,
-        "ggml-metal mul_mv_ext: op=%s tensor='%s' type=%s bs=%lld aux_batch=%lld decode_like=%d decode_strict=%d decode_small_mat=%d pp_small_batch=%d nsg=%d nxpsg=%d r1ptg=%d reason=%s\n",
-        ggml_op_name(op->op),
-        op->name[0] ? op->name : "(unnamed)",
-        ggml_type_name(op->src[0]->type),
-        (long long) cls.bs,
-        (long long) cls.aux_batch,
-        (int) cls.is_decode_like,
-        (int) cls.is_decode_strict,
-        (int) cls.is_decode_small_mat,
-        (int) cls.is_pp_small_batch,
-        nsg,
-        nxpsg,
-        r1ptg,
-        reason ? reason : "none");
+    if (is_id) {
+        const char * non_id = ggml_metal_type_env_name_(type, is_decode_like, false, want_nsg);
+        if (non_id) {
+            const int v = ggml_metal_env_int(non_id, INT_MIN);
+            if (v != INT_MIN) {
+                return v;
+            }
+        }
+    }
+
+    const char * fallback = ggml_metal_type_env_fallback_name_(type, want_nsg);
+    return fallback ? ggml_metal_env_int(fallback, 0) : 0;
+}
+
+static int ggml_metal_env_type_phase_nr0_(ggml_type type, bool is_decode_like, bool is_id) {
+    return ggml_metal_env_type_phase_int_(type, is_decode_like, is_id, false);
+}
+
+static int ggml_metal_env_type_phase_nsg_(ggml_type type, bool is_decode_like, bool is_id) {
+    return ggml_metal_env_type_phase_int_(type, is_decode_like, is_id, true);
+}
+
+static int ggml_metal_decode_shape_threshold_default_(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_BF16: return 2048;
+        case GGML_TYPE_F16:  return 2048;
+        case GGML_TYPE_F32:  return 1024;
+        default:             return 0;
+    }
+}
+
+static int ggml_metal_env_decode_shape_threshold_(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_BF16: return ggml_metal_env_int("GGML_METAL_DECODE_BF16_SHAPE_THRESHOLD", ggml_metal_decode_shape_threshold_default_(type));
+        case GGML_TYPE_F16:  return ggml_metal_env_int("GGML_METAL_DECODE_F16_SHAPE_THRESHOLD",  ggml_metal_decode_shape_threshold_default_(type));
+        case GGML_TYPE_F32:  return ggml_metal_env_int("GGML_METAL_DECODE_F32_SHAPE_THRESHOLD",  ggml_metal_decode_shape_threshold_default_(type));
+        default:             return 0;
+    }
+}
+
+static int ggml_metal_decode_shape_small_nr0_default_(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_BF16: return 4;
+        case GGML_TYPE_F16:  return 4;
+        case GGML_TYPE_F32:  return 2;
+        default:             return 0;
+    }
+}
+
+static int ggml_metal_decode_shape_small_nsg_default_(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_BF16: return 2;
+        case GGML_TYPE_F16:  return 2;
+        case GGML_TYPE_F32:  return 2;
+        default:             return 0;
+    }
+}
+
+static int ggml_metal_env_decode_shape_small_nr0_(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_BF16: return ggml_metal_env_int("GGML_METAL_DECODE_BF16_SMALL_NR0", ggml_metal_decode_shape_small_nr0_default_(type));
+        case GGML_TYPE_F16:  return ggml_metal_env_int("GGML_METAL_DECODE_F16_SMALL_NR0",  ggml_metal_decode_shape_small_nr0_default_(type));
+        case GGML_TYPE_F32:  return ggml_metal_env_int("GGML_METAL_DECODE_F32_SMALL_NR0",  ggml_metal_decode_shape_small_nr0_default_(type));
+        default:             return 0;
+    }
+}
+
+static int ggml_metal_env_decode_shape_small_nsg_(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_BF16: return ggml_metal_env_int("GGML_METAL_DECODE_BF16_SMALL_NSG", ggml_metal_decode_shape_small_nsg_default_(type));
+        case GGML_TYPE_F16:  return ggml_metal_env_int("GGML_METAL_DECODE_F16_SMALL_NSG",  ggml_metal_decode_shape_small_nsg_default_(type));
+        case GGML_TYPE_F32:  return ggml_metal_env_int("GGML_METAL_DECODE_F32_SMALL_NSG",  ggml_metal_decode_shape_small_nsg_default_(type));
+        default:             return 0;
+    }
+}
+
+static bool ggml_metal_apply_decode_shape_heuristic_(
+        const ggml_tensor * op,
+        const ggml_metal_decode_shape_class_ops_ & cls,
+        int * nr0,
+        int * nsg,
+        const char ** reason) {
+    if (!op || !nr0 || !nsg || !reason) {
+        return false;
+    }
+
+    if (!cls.is_decode_strict) {
+        return false;
+    }
+
+    const ggml_type type = op->src[0]->type;
+    if (type != GGML_TYPE_BF16 && type != GGML_TYPE_F16 && type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (ggml_metal_env_type_phase_nr0_(type, true, false) > 0 ||
+        ggml_metal_env_type_phase_nsg_(type, true, false) > 0) {
+        return false;
+    }
+
+    const int threshold = ggml_metal_env_decode_shape_threshold_(type);
+    if (threshold <= 0 || op->src[0]->ne[0] > threshold) {
+        return false;
+    }
+
+    const int small_nr0 = ggml_metal_env_decode_shape_small_nr0_(type);
+    const int small_nsg = ggml_metal_env_decode_shape_small_nsg_(type);
+    if (small_nr0 <= 0 || small_nsg <= 0) {
+        return false;
+    }
+
+    *nr0 = small_nr0;
+    *nsg = small_nsg;
+    switch (type) {
+        case GGML_TYPE_BF16: *reason = "decode-bf16-shape-heuristic"; break;
+        case GGML_TYPE_F16:  *reason = "decode-f16-shape-heuristic";  break;
+        case GGML_TYPE_F32:  *reason = "decode-f32-shape-heuristic";  break;
+        default:             *reason = "decode-shape-heuristic";      break;
+    }
+
+    return true;
 }
 
 static void ggml_metal_log_mmv_select_(
@@ -2021,7 +2174,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //       my current hypothesis is that the work grid is not evenly divisible for different nsg
         //       values and there can be some tail effects when nsg is high. need to confirm this
         //
-        int nsg    = 2;                 // num simdgroups per threadgroup
+        const int nsg    = 2;                 // num simdgroups per threadgroup
 
         // num threads along row per simdgroup
         int16_t nxpsg = 0;
@@ -2033,7 +2186,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             nxpsg = 4;
         }
 
-        int16_t r1ptg  = 4;                 // num src1 rows per threadgroup
+        const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
+        const int16_t r0ptg  = nypsg*nsg;         // num src0 rows per threadgroup
+              int16_t r1ptg  = 4;                 // num src1 rows per threadgroup
 
         // note: not sure how optimal are those across all different hardware. there might be someting cleverer
         switch (ne11) {
@@ -2051,39 +2206,6 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             default:
                 GGML_ABORT("unsupported ne11");
         };
-
-        const bool use_ext_pp_override = !cls.is_decode_like && cls.is_pp_small_batch;
-        if (use_ext_pp_override) {
-            const int env_nsg   = ggml_metal_env_mmv_ext_pp_nsg();
-            const int env_nxpsg = ggml_metal_env_mmv_ext_pp_nxpsg();
-            const int env_r1ptg = ggml_metal_env_mmv_ext_pp_r1ptg();
-
-            if (env_nsg > 0) {
-                nsg = env_nsg;
-            }
-            if (env_nxpsg == 4 || env_nxpsg == 8 || env_nxpsg == 16) {
-                nxpsg = (int16_t) env_nxpsg;
-            }
-            if (env_r1ptg > 0) {
-                r1ptg = (int16_t) env_r1ptg;
-            }
-        }
-
-        GGML_ASSERT(nxpsg > 0);
-        GGML_ASSERT(32 % nxpsg == 0);
-        GGML_ASSERT(nsg > 0);
-        GGML_ASSERT(r1ptg > 0);
-
-        const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
-        const int16_t r0ptg  = nypsg*nsg;         // num src0 rows per threadgroup
-
-        ggml_metal_log_mmv_ext_select_(
-            op,
-            cls,
-            nsg,
-            nxpsg,
-            r1ptg,
-            use_ext_pp_override ? "pp-small-batch-override" : "pipeline-default");
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op->src[0]->type, op->src[1]->type, nsg, nxpsg, r1ptg);
 
@@ -2172,11 +2294,31 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const size_t smem = pipeline.smem;
         
         const bool use_dec_override = cls.is_decode_strict || cls.is_decode_small_mat;
+        const bool use_pp_override  = cls.is_pp_small_batch || !cls.is_decode_like;
+        const char * select_reason = "pipeline-default";
+        const ggml_type mmv_type = op->src[0]->type;
         if (use_dec_override) {
-            const int env_nr0 = ggml_metal_env_mmv_dec_nr0();
-            const int env_nsg = ggml_metal_env_mmv_dec_nsg();
+            const int env_nr0 = ggml_metal_env_type_phase_nr0_(mmv_type, true, false);
+            const int env_nsg = ggml_metal_env_type_phase_nsg_(mmv_type, true, false);
             if (env_nr0 > 0) nr0 = env_nr0;
             if (env_nsg > 0) nsg = env_nsg;
+            if (env_nr0 > 0 || env_nsg > 0) {
+                select_reason = cls.is_decode_strict ? "decode-strict-typed-env" : "decode-small-mat-typed-env";
+            } else if (ggml_metal_apply_decode_shape_heuristic_(op, cls, &nr0, &nsg, &select_reason)) {
+                // reason set by helper
+            } else if (cls.is_decode_small_mat) {
+                select_reason = "decode-small-mat-default";
+            } else if (cls.is_decode_strict) {
+                select_reason = "decode-strict-default";
+            }
+        } else if (use_pp_override) {
+            const int env_nr0 = ggml_metal_env_type_phase_nr0_(mmv_type, false, false);
+            const int env_nsg = ggml_metal_env_type_phase_nsg_(mmv_type, false, false);
+            if (env_nr0 > 0) nr0 = env_nr0;
+            if (env_nsg > 0) nsg = env_nsg;
+            if (env_nr0 > 0 || env_nsg > 0) {
+                select_reason = cls.is_pp_small_batch ? "pp-small-batch-typed-env" : "pp-typed-env";
+            }
         }
         
         ggml_metal_log_mmv_select_(
@@ -2187,9 +2329,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             nr1,
             nsg,
             smem,
-            use_dec_override
-                ? (cls.is_decode_strict ? "decode-strict-override" : "decode-small-mat-override")
-                : "pipeline-default");
+            select_reason);
         
         ggml_metal_kargs_mul_mv args = {
             /*.ne00 =*/ ne00,
@@ -2423,12 +2563,49 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op); // TOTO SLOW overdie de ggml_metal_pipeline_with_params
         //ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op) à trouver dans autre fichier
 
-        const int nr0 = pipeline.nr0;
+        int nr0 = pipeline.nr0;
         const int nr1 = pipeline.nr1;
-        const int nsg = pipeline.nsg;
+        int nsg = pipeline.nsg;
 
         const size_t smem = pipeline.smem;
-        
+        const bool is_q4k_decode = (
+            op->src[0]->type == GGML_TYPE_Q4_K &&
+            (cls.is_decode_strict || cls.is_decode_small_mat)
+        );
+        const bool use_dec_override = cls.is_decode_strict || cls.is_decode_small_mat;
+        const bool use_pp_override  = cls.is_pp_small_batch || !cls.is_decode_like;
+        const ggml_type mmv_type = op->src[0]->type;
+        const char * select_reason = "pipeline-default";
+
+        if (is_q4k_decode) {
+            // Native preference observed for MoE decode on AMD fallback mul_mv_id.
+            nr0 = 8;
+            nsg = 2;
+            select_reason = cls.is_decode_strict ? "q4k-native-decode-strict-8x2" : "q4k-native-decode-small-mat-8x2";
+        } else if (use_dec_override) {
+            const int env_nr0 = ggml_metal_env_type_phase_nr0_(mmv_type, true, true);
+            const int env_nsg = ggml_metal_env_type_phase_nsg_(mmv_type, true, true);
+            if (env_nr0 > 0) nr0 = env_nr0;
+            if (env_nsg > 0) nsg = env_nsg;
+            if (env_nr0 > 0 || env_nsg > 0) {
+                select_reason = cls.is_decode_strict ? "decode-strict-typed-env" : "decode-small-mat-typed-env";
+            } else if (ggml_metal_apply_decode_shape_heuristic_(op, cls, &nr0, &nsg, &select_reason)) {
+                // reason set by helper
+            } else if (cls.is_decode_small_mat) {
+                select_reason = "decode-small-mat-default";
+            } else if (cls.is_decode_strict) {
+                select_reason = "decode-strict-default";
+            }
+        } else if (use_pp_override) {
+            const int env_nr0 = ggml_metal_env_type_phase_nr0_(mmv_type, false, true);
+            const int env_nsg = ggml_metal_env_type_phase_nsg_(mmv_type, false, true);
+            if (env_nr0 > 0) nr0 = env_nr0;
+            if (env_nsg > 0) nsg = env_nsg;
+            if (env_nr0 > 0 || env_nsg > 0) {
+                select_reason = cls.is_pp_small_batch ? "pp-small-batch-typed-env" : "pp-typed-env";
+            }
+        }
+
         ggml_metal_log_mmv_select_(
             "mul_mv_id",
             op,
@@ -2437,7 +2614,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             nr1,
             nsg,
             smem,
-            "pipeline-default");
+            select_reason);
         
         ggml_metal_kargs_mul_mv_id args = {
             /*.nei0 =*/ ne20,
@@ -2549,6 +2726,17 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     // Provide ne20 (head size V) via GGML_TENSOR_LOCALS on src2
     GGML_TENSOR_LOCALS(int32_t, ne2, op->src[2], ne); // ne20
 
+    const bool has_mask  = op->src[3] != nullptr;
+    const bool has_sinks = op->src[4] != nullptr;
+
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      ((const int32_t *) op->op_params) + 1, sizeof(max_bias));
+    memcpy(&logit_softcap, ((const int32_t *) op->op_params) + 2, sizeof(logit_softcap));
+
+    const bool has_bias = max_bias != 0.0f;
+    const bool has_scap = logit_softcap != 0.0f;
+
     // Env override:
     //   -1 = auto (default)
     //    0 = force off
@@ -2564,7 +2752,6 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
         return false;
     }
 
-    // Conservative guardrails for vec kernel path (robustness first).
     const int32_t dkq = (int32_t) ne00;
     const int32_t dv  = (int32_t) ne20;
 
@@ -2575,32 +2762,34 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
 
     const bool dims_ok    = (dkq <= 256) && (dv <= 256) && (dkq % 32 == 0) && (dv % 8 == 0);
     const bool kv_aligned = (ne11 % OP_FLASH_ATTN_EXT_VEC_NCPSG) == 0;
+    const bool kv_ok      = kv_aligned || ggml_metal_env_fa_vec_allow_kvpad();
 
-    const bool use_vec = type_ok && dims_ok && kv_aligned;
+    // Keep auto conservative on AMD unless explicitly relaxed.
+    const bool feature_safe = (!has_sinks && !has_bias && !has_scap) || ggml_metal_env_fa_amd_vec_relax();
 
-    // If user requests vec ON but guardrails reject it, keep it OFF (avoid hangs).
+    const bool use_vec = type_ok && dims_ok && kv_ok && feature_safe;
+
     if (env_vec == 1 && !use_vec) {
         if (ggml_metal_fa_log_enabled()) {
             GGML_LOG_INFO(
                 "ggml-metal: FA: vec requested but rejected by guardrails "
-                "(dkq=%d dv=%d B=%d type_ok=%d kv_aligned=%d ne11=%d ncpsg=%d)\n",
-                (int) dkq, (int) dv, (int) ne01, (int) type_ok, (int) kv_aligned,
-                (int) ne11, (int) OP_FLASH_ATTN_EXT_VEC_NCPSG);
+                "(dkq=%d dv=%d B=%d type_ok=%d kv_aligned=%d kv_ok=%d feature_safe=%d ne11=%d ncpsg=%d)\n",
+                (int) dkq, (int) dv, (int) ne01, (int) type_ok, (int) kv_aligned, (int) kv_ok,
+                (int) feature_safe, (int) ne11, (int) OP_FLASH_ATTN_EXT_VEC_NCPSG);
         }
         return false;
     }
 
     if (ggml_metal_fa_log_enabled()) {
         GGML_LOG_INFO(
-            "ggml-metal: FA: use_vec=%d (dkq=%d dv=%d B=%d ne11=%d ncpsg=%d types=[%d,%d,%d])\n",
+            "ggml-metal: FA: use_vec=%d (dkq=%d dv=%d B=%d ne11=%d ncpsg=%d kv_aligned=%d kv_ok=%d feature_safe=%d types=[%d,%d,%d])\n",
             (int) use_vec, (int) dkq, (int) dv, (int) ne01, (int) ne11, (int) OP_FLASH_ATTN_EXT_VEC_NCPSG,
+            (int) kv_aligned, (int) kv_ok, (int) feature_safe,
             (int) op->src[0]->type, (int) op->src[1]->type, (int) op->src[2]->type);
     }
 
     return use_vec;
 }
-
-
 
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
@@ -2831,8 +3020,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     }
 
     if (ggml_metal_fa_log_enabled()) {
-        GGML_LOG_DEBUG("ggml_metal: fattn_ext select: use_vec=%d env_vec=%d amd=%d\n",
-                       (int) use_vec, (int) env_vec, (int) ggml_metal_device_is_amd(ctx->dev));
+        GGML_LOG_DEBUG("ggml_metal: fattn_ext select: use_vec=%d env_vec=%d amd=%d amd_relax=%d\n",
+                       (int) use_vec, (int) env_vec, (int) ggml_metal_device_is_amd(ctx->dev),
+                       (int) ggml_metal_env_fa_amd_vec_relax());
     }
 
     if (!use_vec) {
@@ -2940,7 +3130,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
 
         // Optional override (robustness/diagnostics)
-        const int32_t env_nsg = ggml_metal_env_int("GGML_METAL_FA_NSG", 0);
+        int32_t env_nsg = ggml_metal_env_fa_tiled_nsg();
+        if (env_nsg <= 0) {
+            env_nsg = ggml_metal_env_int("GGML_METAL_FA_NSG", 0);
+        }
         if (env_nsg > 0) {
             const int32_t v = env_nsg;
             const bool is_pow2 = (v & (v - 1)) == 0;
@@ -3103,6 +3296,22 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             while (2*nwg*nsg*nkpsg < ne11 && nsg < 4) {
                 nsg *= 2;
             }
+        }
+
+        int32_t env_vec_nsg = ggml_metal_env_fa_vec_nsg();
+        if (env_vec_nsg <= 0) {
+            env_vec_nsg = ggml_metal_env_int("GGML_METAL_FA_NSG", 0);
+        }
+        if (env_vec_nsg > 0) {
+            const bool is_pow2 = (env_vec_nsg & (env_vec_nsg - 1)) == 0;
+            if (is_pow2 && env_vec_nsg >= 1 && env_vec_nsg <= 32) {
+                nsg = env_vec_nsg;
+            }
+        }
+
+        const int32_t env_vec_nwg = ggml_metal_env_fa_vec_nwg();
+        if (env_vec_nwg > 0) {
+            nwg = env_vec_nwg;
         }
 
         if (ggml_metal_fa_log_enabled()) {

@@ -784,57 +784,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 suffix = ne00 % 4 == 0 ? "_4" : "";
             }
 
-            // Optional override: rows per threadgroup for F32/F16/BF16 mat-vec (non-short path).
-            // Phase-aware precedence:
-            //   decode-like: GGML_METAL_DECODE_F32_NR0 / F16 / BF16
-            //   PP/non-decode: GGML_METAL_PP_F32_NR0 / F16 / BF16
-            //   fallback: GGML_METAL_F32_NR0 / F16 / BF16
-            if (strcmp(suffix, "_short") != 0) {
-                const bool is_f32  = (tsrc0 == GGML_TYPE_F32);
-                const bool is_f16  = (tsrc0 == GGML_TYPE_F16);
-                const bool is_bf16 = (tsrc0 == GGML_TYPE_BF16);
-
-                const char * env = is_f32
-                    ? ggml_metal_getenv_phase_pref_(is_decode_like,
-                          "GGML_METAL_DECODE_F32_NR0",
-                          "GGML_METAL_PP_F32_NR0",
-                          "GGML_METAL_F32_NR0")
-                    : is_f16
-                        ? ggml_metal_getenv_phase_pref_(is_decode_like,
-                              "GGML_METAL_DECODE_F16_NR0",
-                              "GGML_METAL_PP_F16_NR0",
-                              "GGML_METAL_F16_NR0")
-                        : is_bf16
-                            ? ggml_metal_getenv_phase_pref_(is_decode_like,
-                                  "GGML_METAL_DECODE_BF16_NR0",
-                                  "GGML_METAL_PP_BF16_NR0",
-                                  "GGML_METAL_BF16_NR0")
-                            : NULL;
-
-                if (env && env[0]) {
-                    const int v = atoi(env);
-                    // Supported NR0 values are those compiled into the Metal dispatch switch.
-                    if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16 || v == 32) {
-                        nr0  = v;
-                        smem = 32 * sizeof(float) * nr0;
-                    }
-
-                    static bool s_logged_f32  = false;
-                    static bool s_logged_f16  = false;
-                    static bool s_logged_bf16 = false;
-                    bool & s_logged = is_f32 ? s_logged_f32 : (is_f16 ? s_logged_f16 : s_logged_bf16);
-
-                    if (!s_logged) {
-                        s_logged = true;
-                        GGML_LOG_INFO(
-                            "%s: %s NR0 override = %d (decode_like=%d)\n",
-                            __func__,
-                            is_f32 ? "F32" : (is_f16 ? "F16" : "BF16"),
-                            (int) nr0,
-                            (int) is_decode_like);
-                    }
-                }
-            }
+            // Dense F32/F16/BF16 runtime tuning now lives in ggml-metal-ops.cpp.
+            // device.cpp keeps only the default pipeline selection and compile-time entrypoint choice.
         } break;
 
         case GGML_TYPE_Q4_0:
@@ -1650,29 +1601,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             smem = 32*sizeof(float)*nr0;
             suffix = ne00 % 4 == 0 ? "_4" : "";
 
-            // Optional override: rows per threadgroup for F32/F16 mat-vec (non-short path).
-            if (strcmp(suffix, "_short") != 0) {
-                const bool is_f32 = (tsrc0 == GGML_TYPE_F32);
-                const bool is_f16 = (tsrc0 == GGML_TYPE_F16);
-                const char * env = is_f32 ? getenv("GGML_METAL_F32_NR0")
-                                  : is_f16 ? getenv("GGML_METAL_F16_NR0")
-                                           : NULL;
-                if (env) {
-                    const int v = atoi(env);
-                    if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16 || v == 32) {
-                        nr0  = v;
-                        smem = 32*sizeof(float)*nr0;
-                    }
-                    static bool s_logged_f32 = false;
-                    static bool s_logged_f16 = false;
-                    bool & s_logged = is_f32 ? s_logged_f32 : s_logged_f16;
-                    if (!s_logged) {
-                        s_logged = true;
-                        GGML_LOG_INFO("%s: %s NR0 override = %d\n",
-                                      __func__, is_f32 ? "F32" : "F16", (int) nr0);
-                    }
-                }
-            }
+            // Dense-ID F32/F16/BF16 runtime tuning now lives in ggml-metal-ops.cpp.
+            // device.cpp keeps only the default pipeline selection and compile-time entrypoint choice.
         } break;
 
         case GGML_TYPE_Q4_0: {
