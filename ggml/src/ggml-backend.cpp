@@ -834,6 +834,131 @@ struct ggml_backend_sched {
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
 
+
+static inline bool ggml_backend_sched_assignment_log_enabled_() {
+    const char * s = getenv("GGML_SCHED_ASSIGNMENT_LOG");
+    return s && s[0] && atoi(s) != 0;
+}
+
+static inline bool ggml_backend_sched_assignment_summary_enabled_() {
+    const char * s = getenv("GGML_SCHED_ASSIGNMENT_SUMMARY");
+    return s && s[0] && atoi(s) != 0;
+}
+
+static inline bool ggml_backend_sched_is_traced_op_(const struct ggml_tensor * node) {
+    if (node == NULL) {
+        return false;
+    }
+    return node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID;
+}
+
+static void ggml_backend_sched_assignment_dump_(ggml_backend_sched_t sched, const char * stage, const struct ggml_cgraph * graph) {
+    const int sched_log_enabled = ggml_backend_sched_assignment_log_enabled_() ? 1 : 0;
+    const int sched_summary_enabled = ggml_backend_sched_assignment_summary_enabled_() ? 1 : 0;
+    fprintf(stderr, "SCHED_DUMP entered stage=%s log=%d summary=%d\n",
+            stage ? stage : "", sched_log_enabled, sched_summary_enabled);
+    if (!sched_log_enabled && !sched_summary_enabled) {
+        return;
+    }
+    if (sched == NULL || graph == NULL) {
+        fprintf(stderr, "SCHED_DUMP early-return-null stage=%s\n", stage ? stage : "");
+        return;
+    }
+
+    std::vector<uint64_t> split_nodes_by_backend((size_t) sched->n_backends, 0);
+    std::vector<uint64_t> mul_mat_by_backend((size_t) sched->n_backends, 0);
+    std::vector<uint64_t> mul_mat_id_by_backend((size_t) sched->n_backends, 0);
+    std::vector<uint64_t> split_inputs_by_backend((size_t) sched->n_backends, 0);
+    uint64_t total_splits = 0;
+    uint64_t total_inputs = 0;
+    uint64_t total_mul_mat = 0;
+    uint64_t total_mul_mat_id = 0;
+
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const struct ggml_backend_sched_split * split = &sched->splits[i];
+        const int backend_id = split->backend_id;
+        const char * backend_name = (backend_id >= 0 && backend_id < sched->n_backends)
+            ? ggml_backend_name(sched->backends[backend_id])
+            : "unknown";
+
+        total_splits++;
+        if (backend_id >= 0 && backend_id < sched->n_backends) {
+            split_inputs_by_backend[(size_t) backend_id] += (uint64_t) split->n_inputs;
+            total_inputs += (uint64_t) split->n_inputs;
+        }
+
+        uint64_t split_mul_mat = 0;
+        uint64_t split_mul_mat_id = 0;
+        uint64_t split_traced_nodes = 0;
+
+        for (int j = split->i_start; j < split->i_end; ++j) {
+            struct ggml_tensor * node = graph->nodes[j];
+            if (node == NULL || ggml_is_view_op(node->op)) {
+                continue;
+            }
+            if (!ggml_backend_sched_is_traced_op_(node)) {
+                continue;
+            }
+
+            split_traced_nodes++;
+
+            if (node->op == GGML_OP_MUL_MAT) {
+                split_mul_mat++;
+                total_mul_mat++;
+                if (backend_id >= 0 && backend_id < sched->n_backends) {
+                    mul_mat_by_backend[(size_t) backend_id]++;
+                    split_nodes_by_backend[(size_t) backend_id]++;
+                }
+            } else if (node->op == GGML_OP_MUL_MAT_ID) {
+                split_mul_mat_id++;
+                total_mul_mat_id++;
+                if (backend_id >= 0 && backend_id < sched->n_backends) {
+                    mul_mat_id_by_backend[(size_t) backend_id]++;
+                    split_nodes_by_backend[(size_t) backend_id]++;
+                }
+            }
+        }
+
+        if (sched_log_enabled) {
+            fprintf(stderr,
+                "%s: stage=%s split-start split=%d backend=%d backend_name=%s i_start=%d i_end=%d n_inputs=%d mul_mat=%llu mul_mat_id=%llu traced_nodes=%llu\n",
+                __func__, stage ? stage : "", i, backend_id, backend_name ? backend_name : "",
+                split->i_start, split->i_end, split->n_inputs,
+                (unsigned long long) split_mul_mat,
+                (unsigned long long) split_mul_mat_id,
+                (unsigned long long) split_traced_nodes);
+
+            for (int k = 0; k < split->n_inputs; ++k) {
+                const struct ggml_tensor * in = split->inputs[k];
+                fprintf(stderr,
+                    "%s: stage=%s split-input split=%d backend=%d backend_name=%s input=%d tensor='%s'\n",
+                    __func__, stage ? stage : "", i, backend_id, backend_name ? backend_name : "",
+                    k, in ? in->name : "");
+            }
+        }
+    }
+
+    if (sched_summary_enabled) {
+        fprintf(stderr,
+            "%s: stage=%s summary splits=%llu inputs=%llu mul_mat=%llu mul_mat_id=%llu\n",
+            __func__, stage ? stage : "",
+            (unsigned long long) total_splits,
+            (unsigned long long) total_inputs,
+            (unsigned long long) total_mul_mat,
+            (unsigned long long) total_mul_mat_id);
+
+        for (int b = 0; b < sched->n_backends; ++b) {
+            fprintf(stderr,
+                "%s: stage=%s summary-backend backend=%d backend_name=%s split_nodes=%llu mul_mat=%llu mul_mat_id=%llu split_inputs=%llu\n",
+                __func__, stage ? stage : "", b, ggml_backend_name(sched->backends[b]),
+                (unsigned long long) split_nodes_by_backend[(size_t) b],
+                (unsigned long long) mul_mat_by_backend[(size_t) b],
+                (unsigned long long) mul_mat_id_by_backend[(size_t) b],
+                (unsigned long long) split_inputs_by_backend[(size_t) b]);
+        }
+    }
+}
+
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
     for (int i = 0; i < sched->n_backends; i++) {
@@ -916,6 +1041,40 @@ static inline void ggml_backend_sched_trace_copy_(
         dst ? dst->name : "",
         nbytes,
         extra ? extra : "");
+}
+
+struct ggml_backend_sched_copy_stats_ {
+    uint64_t user_sync_copies = 0;
+    uint64_t async_ok = 0;
+    uint64_t async_fallback = 0;
+    uint64_t no_async = 0;
+    uint64_t sync_copy = 0;
+    uint64_t event_waits = 0;
+    uint64_t event_records = 0;
+    uint64_t moe_sparse_inputs = 0;
+    uint64_t moe_sparse_ranges = 0;
+    uint64_t moe_sparse_bytes = 0;
+};
+
+static inline void ggml_backend_sched_copy_stats_dump_(
+        ggml_backend_sched_t sched,
+        const ggml_backend_sched_copy_stats_ & st) {
+    if (!ggml_backend_sched_trace_copy_enabled_() || sched == NULL) {
+        return;
+    }
+
+    GGML_LOG_INFO(
+        "ggml-backend: copy-summary: user_sync=%llu async_ok=%llu async_fallback=%llu no_async=%llu sync_copy=%llu event_waits=%llu event_records=%llu moe_sparse_inputs=%llu moe_sparse_ranges=%llu moe_sparse_bytes=%llu\n",
+        (unsigned long long) st.user_sync_copies,
+        (unsigned long long) st.async_ok,
+        (unsigned long long) st.async_fallback,
+        (unsigned long long) st.no_async,
+        (unsigned long long) st.sync_copy,
+        (unsigned long long) st.event_waits,
+        (unsigned long long) st.event_records,
+        (unsigned long long) st.moe_sparse_inputs,
+        (unsigned long long) st.moe_sparse_ranges,
+        (unsigned long long) st.moe_sparse_bytes);
 }
 
 // returns the backend that should be used for the node based on the current locations
@@ -1596,6 +1755,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
     std::vector<uint8_t> moe_copy_tmp;
+    ggml_backend_sched_copy_stats_ copy_stats;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1609,9 +1769,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+            if (ggml_backend_sched_trace_copy_enabled_()) {
+                GGML_LOG_INFO(
+                    "ggml-backend: copy-input: split=%d input_id=%d src_b=%d dst_b=%d src='%s' dst='%s' bytes=%zu flags=0x%x\n",
+                    split_id,
+                    input_id,
+                    input_backend_id,
+                    split_backend_id,
+                    input ? input->name : "",
+                    input_cpy ? input_cpy->name : "",
+                    input ? ggml_nbytes(input) : 0,
+                    input ? input->flags : 0);
+            }
+
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                    copy_stats.user_sync_copies++;
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -1621,6 +1795,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                    copy_stats.event_waits++;
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -1643,6 +1818,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
                     moe_sparse_stats.sparse_inputs++;
+                    copy_stats.moe_sparse_inputs++;
                     moe_sparse_stats.input_backend_syncs++;
                     ggml_backend_synchronize(input_backend);
 
@@ -1688,6 +1864,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
                         const size_t copy_bytes = expert_size_copy + padding_end;
+
+                        copy_stats.moe_sparse_ranges++;
+                        copy_stats.moe_sparse_bytes += copy_bytes;
+                        if (ggml_backend_sched_trace_copy_enabled_()) {
+                            GGML_LOG_INFO(
+                                "ggml-backend: copy-moe-range: split=%d src_b=%d dst_b=%d src='%s' dst='%s' first_id=%d last_id=%d expert_offset=%zu bytes=%zu host=%d\n",
+                                split_id,
+                                input_backend_id,
+                                split_backend_id,
+                                input ? input->name : "",
+                                input_cpy ? input_cpy->name : "",
+                                (int) first_id,
+                                (int) last_id,
+                                expert_offset,
+                                copy_bytes,
+                                input_is_host ? 1 : 0);
+                        }
 
                         if (input_is_host) {
                             ggml_backend_tensor_set_async(split_backend,
@@ -1742,9 +1935,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const bool has_async = split_backend->iface.cpy_tensor_async != NULL;
                     const bool async_ok = has_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
                     if (async_ok) {
+                        copy_stats.async_ok++;
                         ggml_backend_sched_trace_copy_(sched, "5.async-ok", split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), "cpy_tensor_async");
                     }
                     if (!async_ok) {
+                        if (has_async) {
+                            copy_stats.async_fallback++;
+                        } else {
+                            copy_stats.no_async++;
+                        }
                         ggml_backend_sched_trace_copy_(sched, has_async ? "5.async-fallback" : "5.no-async", split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), has_async ? "async-copy-failed" : "iface-null");
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1752,6 +1951,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
+                        copy_stats.sync_copy++;
                         ggml_backend_sched_trace_copy_(sched, "5.sync-copy", split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), "blocking-copy");
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
@@ -1763,6 +1963,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 ggml_backend_sched_log_moe_sparse_stats_(&moe_sparse_stats);
+                ggml_backend_sched_copy_stats_dump_(sched, copy_stats);
                 return ec;
             }
         } else {
@@ -1803,6 +2004,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                copy_stats.event_records++;
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
@@ -1928,6 +2130,7 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+    ggml_backend_sched_assignment_dump_(sched, "reserve_size", &sched->graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
 }
@@ -1939,6 +2142,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+    ggml_backend_sched_assignment_dump_(sched, "reserve", &sched->graph);
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
@@ -1958,6 +2162,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
     ggml_backend_sched_split_graph(sched, graph);
+    ggml_backend_sched_assignment_dump_(sched, "alloc_graph", &sched->graph);
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;

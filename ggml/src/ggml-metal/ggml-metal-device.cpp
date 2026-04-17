@@ -817,6 +817,45 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             nsg = N_SG_Q8_0;
             nr0 = N_R0_Q8_0;
             smem = 32 * sizeof(float) * N_R0_Q8_0;
+
+            // Phase-aware overrides for Q8_0 mul_mv:
+            // - decode-like: GGML_METAL_DECODE_Q80_*
+            // - PP/non-decode: GGML_METAL_PP_Q80_*
+            // - fallback: existing generic GGML_METAL_Q80_*
+            // Note: Q8_0 NR0 remains compile-time in the current Metal kernel set.
+            // We therefore honor NSG overrides here, but clamp NR0 to the baked default and
+            // only surface non-default NR0 requests via a one-time info log.
+            const char * env_q80_nsg =
+                ggml_metal_getenv_phase_pref_(is_decode_like,
+                                              "GGML_METAL_DECODE_Q80_NSG",
+                                              "GGML_METAL_PP_Q80_NSG",
+                                              "GGML_METAL_Q80_NSG");
+
+            const char * env_q80_nr0 =
+                ggml_metal_getenv_phase_pref_(is_decode_like,
+                                              "GGML_METAL_DECODE_Q80_NR0",
+                                              "GGML_METAL_PP_Q80_NR0",
+                                              "GGML_METAL_Q80_NR0");
+
+            if (env_q80_nsg && env_q80_nsg[0]) {
+                const int v = atoi(env_q80_nsg);
+                if (v >= 1 && v <= 8) {
+                    nsg = v;
+                }
+            }
+
+            if (env_q80_nr0 && env_q80_nr0[0]) {
+                const int v = atoi(env_q80_nr0);
+                if (v != N_R0_Q8_0) {
+                    static bool s_logged_q80_nr0_ignored = false;
+                    if (!s_logged_q80_nr0_ignored) {
+                        s_logged_q80_nr0_ignored = true;
+                        GGML_LOG_INFO(
+                            "%s: Q8_0 NR0 override requested (%d) but current Metal kernels bake NR0=%d; ignoring NR0 override and applying NSG only\n",
+                            __func__, v, (int) N_R0_Q8_0);
+                    }
+                }
+            }
         } break;
 
         case GGML_TYPE_MXFP4:
@@ -1629,6 +1668,54 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             nsg = N_SG_Q8_0;
             nr0 = N_R0_Q8_0;
             smem = 32*sizeof(float)*N_R0_Q8_0;
+
+            const char * env_q80_nsg = ggml_metal_getenv_phase_pref_(
+                is_decode_like,
+                "GGML_METAL_DECODE_Q80_ID_NSG",
+                "GGML_METAL_PP_Q80_ID_NSG",
+                "GGML_METAL_Q80_NSG");
+
+            const char * env_q80_nr0 = ggml_metal_getenv_phase_pref_(
+                is_decode_like,
+                "GGML_METAL_DECODE_Q80_ID_NR0",
+                "GGML_METAL_PP_Q80_ID_NR0",
+                "GGML_METAL_Q80_NR0");
+
+            // Also honor non-ID Q8_0 envs as fallback for convenience/consistency with ops.cpp.
+            if ((!env_q80_nsg || !env_q80_nsg[0])) {
+                env_q80_nsg = ggml_metal_getenv_phase_pref_(
+                    is_decode_like,
+                    "GGML_METAL_DECODE_Q80_NSG",
+                    "GGML_METAL_PP_Q80_NSG",
+                    "GGML_METAL_Q80_NSG");
+            }
+            if ((!env_q80_nr0 || !env_q80_nr0[0])) {
+                env_q80_nr0 = ggml_metal_getenv_phase_pref_(
+                    is_decode_like,
+                    "GGML_METAL_DECODE_Q80_NR0",
+                    "GGML_METAL_PP_Q80_NR0",
+                    "GGML_METAL_Q80_NR0");
+            }
+
+            if (env_q80_nsg && env_q80_nsg[0]) {
+                const int v = atoi(env_q80_nsg);
+                if (v >= 1 && v <= 8) {
+                    nsg = v;
+                }
+            }
+
+            if (env_q80_nr0 && env_q80_nr0[0]) {
+                const int v = atoi(env_q80_nr0);
+                if (v != N_R0_Q8_0) {
+                    static bool s_logged_q80_id_nr0_ignored = false;
+                    if (!s_logged_q80_id_nr0_ignored) {
+                        s_logged_q80_id_nr0_ignored = true;
+                        GGML_LOG_INFO(
+                            "%s: Q8_0 mul_mv_id NR0 override requested (%d) but current Metal kernels bake NR0=%d; ignoring NR0 override and applying NSG only\n",
+                            __func__, v, (int) N_R0_Q8_0);
+                    }
+                }
+            }
         } break;
 
         case GGML_TYPE_MXFP4: {

@@ -174,6 +174,242 @@ static ggml_metal_decode_shape_class_ ggml_metal_classify_decode_shape_(const gg
     
     return cls;
 }
+
+
+static bool ggml_metal_env_mgpu_policy_log_(void) {
+    const char * v = getenv("GGML_METAL_MGPU_POLICY_LOG");
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+static bool ggml_metal_env_mgpu_policy_summary_(void) {
+    const char * v = getenv("GGML_METAL_MGPU_POLICY_SUMMARY");
+    return v != NULL && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+struct ggml_metal_mgpu_policy_stats_ {
+    // supports_op stage
+    uint64_t supports_mul_mat_yes = 0;
+    uint64_t supports_mul_mat_no = 0;
+    uint64_t supports_mul_mat_id_yes = 0;
+    uint64_t supports_mul_mat_id_no = 0;
+
+    // offload_op stage
+    uint64_t offload_mul_mat_gpu = 0;
+    uint64_t offload_mul_mat_cpu = 0;
+    uint64_t offload_mul_mat_id_gpu = 0;
+    uint64_t offload_mul_mat_id_cpu = 0;
+
+    // optional non-mat counters to understand "OTHER"/embd noise
+    uint64_t offload_other_cpu = 0;
+    uint64_t offload_other_gpu = 0;
+
+    std::unordered_map<std::string, uint64_t> supports_yes_by_dev;
+    std::unordered_map<std::string, uint64_t> supports_no_by_dev;
+    std::unordered_map<std::string, uint64_t> offload_gpu_by_dev;
+    std::unordered_map<std::string, uint64_t> offload_cpu_by_dev;
+
+    bool thresholds_logged = false;
+    bool atexit_registered = false;
+};
+
+static ggml_metal_mgpu_policy_stats_ g_ggml_metal_mgpu_policy_stats_;
+static std::mutex g_ggml_metal_mgpu_policy_mu_;
+
+static void ggml_metal_mgpu_policy_dump_summary_(void) {
+    if (!ggml_metal_env_mgpu_policy_summary_() && !ggml_metal_env_mgpu_policy_log_()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_ggml_metal_mgpu_policy_mu_);
+
+    fprintf(stderr,
+            "ggml-metal policy-summary-supports: MUL_MAT yes=%llu no=%llu | MUL_MAT_ID yes=%llu no=%llu\n",
+            (unsigned long long) g_ggml_metal_mgpu_policy_stats_.supports_mul_mat_yes,
+            (unsigned long long) g_ggml_metal_mgpu_policy_stats_.supports_mul_mat_no,
+            (unsigned long long) g_ggml_metal_mgpu_policy_stats_.supports_mul_mat_id_yes,
+            (unsigned long long) g_ggml_metal_mgpu_policy_stats_.supports_mul_mat_id_no);
+
+    fprintf(stderr,
+            "ggml-metal policy-summary-offload: MUL_MAT gpu=%llu cpu=%llu | MUL_MAT_ID gpu=%llu cpu=%llu | OTHER gpu=%llu cpu=%llu\n",
+            (unsigned long long) g_ggml_metal_mgpu_policy_stats_.offload_mul_mat_gpu,
+            (unsigned long long) g_ggml_metal_mgpu_policy_stats_.offload_mul_mat_cpu,
+            (unsigned long long) g_ggml_metal_mgpu_policy_stats_.offload_mul_mat_id_gpu,
+            (unsigned long long) g_ggml_metal_mgpu_policy_stats_.offload_mul_mat_id_cpu,
+            (unsigned long long) g_ggml_metal_mgpu_policy_stats_.offload_other_gpu,
+            (unsigned long long) g_ggml_metal_mgpu_policy_stats_.offload_other_cpu);
+
+    if (!g_ggml_metal_mgpu_policy_stats_.supports_yes_by_dev.empty()) {
+        fprintf(stderr, "ggml-metal policy-summary-supports-yes-dev:");
+        for (const auto & kv : g_ggml_metal_mgpu_policy_stats_.supports_yes_by_dev) {
+            fprintf(stderr, " %s=%llu", kv.first.c_str(), (unsigned long long) kv.second);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (!g_ggml_metal_mgpu_policy_stats_.supports_no_by_dev.empty()) {
+        fprintf(stderr, "ggml-metal policy-summary-supports-no-dev:");
+        for (const auto & kv : g_ggml_metal_mgpu_policy_stats_.supports_no_by_dev) {
+            fprintf(stderr, " %s=%llu", kv.first.c_str(), (unsigned long long) kv.second);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (!g_ggml_metal_mgpu_policy_stats_.offload_gpu_by_dev.empty()) {
+        fprintf(stderr, "ggml-metal policy-summary-offload-gpu-dev:");
+        for (const auto & kv : g_ggml_metal_mgpu_policy_stats_.offload_gpu_by_dev) {
+            fprintf(stderr, " %s=%llu", kv.first.c_str(), (unsigned long long) kv.second);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (!g_ggml_metal_mgpu_policy_stats_.offload_cpu_by_dev.empty()) {
+        fprintf(stderr, "ggml-metal policy-summary-offload-cpu-dev:");
+        for (const auto & kv : g_ggml_metal_mgpu_policy_stats_.offload_cpu_by_dev) {
+            fprintf(stderr, " %s=%llu", kv.first.c_str(), (unsigned long long) kv.second);
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
+static void ggml_metal_mgpu_policy_register_atexit_(void) {
+    std::lock_guard<std::mutex> lock(g_ggml_metal_mgpu_policy_mu_);
+    if (!g_ggml_metal_mgpu_policy_stats_.atexit_registered) {
+        atexit(ggml_metal_mgpu_policy_dump_summary_);
+        g_ggml_metal_mgpu_policy_stats_.atexit_registered = true;
+    }
+}
+
+static void ggml_metal_mgpu_policy_log_thresholds_(
+        ggml_backend_dev_t dev,
+        int64_t offload_min_bs,
+        int64_t effective_offload_min_bs,
+        int mgpu_decode_min_bs,
+        int small_mat_offload_max_bs,
+        int pp_dense_mul_mat_min_bs,
+        int pp_dense_mul_mat_min_work_m,
+        int64_t mul_mat_work_m) {
+    if (!ggml_metal_env_mgpu_policy_log_()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_ggml_metal_mgpu_policy_mu_);
+    if (g_ggml_metal_mgpu_policy_stats_.thresholds_logged) {
+        return;
+    }
+    g_ggml_metal_mgpu_policy_stats_.thresholds_logged = true;
+    fprintf(stderr,
+            "ggml-metal policy-thresholds: dev='%s' offload_min_bs=%lld effective_offload_min_bs=%lld mgpu_decode_min_bs=%d small_mat_offload_max_bs=%d pp_dense_mul_mat_min_bs=%d pp_dense_mul_mat_min_work_m=%d mul_mat_work_m=%lld\n",
+            ggml_backend_dev_description(dev),
+            (long long) offload_min_bs,
+            (long long) effective_offload_min_bs,
+            mgpu_decode_min_bs,
+            small_mat_offload_max_bs,
+            pp_dense_mul_mat_min_bs,
+            pp_dense_mul_mat_min_work_m,
+            (long long) mul_mat_work_m);
+}
+
+static void ggml_metal_mgpu_policy_record_(
+        const char * stage,
+        ggml_backend_dev_t dev,
+        const ggml_tensor * op,
+        int64_t bs,
+        const ggml_metal_decode_shape_class_ & cls,
+        bool decision_yes,
+        const char * reason) {
+    if (op == NULL) {
+        return;
+    }
+
+    ggml_metal_mgpu_policy_register_atexit_();
+
+    const char * dev_name = ggml_backend_dev_description(dev);
+    std::string dev_key = std::string(dev_name ? dev_name : "(unknown)");
+
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_metal_mgpu_policy_mu_);
+
+        const bool is_supports = stage != NULL && strcmp(stage, "supports_op") == 0;
+        const bool is_offload  = stage != NULL && strcmp(stage, "offload_op") == 0;
+
+        if (is_supports) {
+            switch (op->op) {
+                case GGML_OP_MUL_MAT:
+                    if (decision_yes) {
+                        g_ggml_metal_mgpu_policy_stats_.supports_mul_mat_yes++;
+                        g_ggml_metal_mgpu_policy_stats_.supports_yes_by_dev[dev_key]++;
+                    } else {
+                        g_ggml_metal_mgpu_policy_stats_.supports_mul_mat_no++;
+                        g_ggml_metal_mgpu_policy_stats_.supports_no_by_dev[dev_key]++;
+                    }
+                    break;
+                case GGML_OP_MUL_MAT_ID:
+                    if (decision_yes) {
+                        g_ggml_metal_mgpu_policy_stats_.supports_mul_mat_id_yes++;
+                        g_ggml_metal_mgpu_policy_stats_.supports_yes_by_dev[dev_key]++;
+                    } else {
+                        g_ggml_metal_mgpu_policy_stats_.supports_mul_mat_id_no++;
+                        g_ggml_metal_mgpu_policy_stats_.supports_no_by_dev[dev_key]++;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        if (is_offload) {
+            switch (op->op) {
+                case GGML_OP_MUL_MAT:
+                    if (decision_yes) {
+                        g_ggml_metal_mgpu_policy_stats_.offload_mul_mat_gpu++;
+                        g_ggml_metal_mgpu_policy_stats_.offload_gpu_by_dev[dev_key]++;
+                    } else {
+                        g_ggml_metal_mgpu_policy_stats_.offload_mul_mat_cpu++;
+                        g_ggml_metal_mgpu_policy_stats_.offload_cpu_by_dev["CPU"]++;
+                    }
+                    break;
+                case GGML_OP_MUL_MAT_ID:
+                    if (decision_yes) {
+                        g_ggml_metal_mgpu_policy_stats_.offload_mul_mat_id_gpu++;
+                        g_ggml_metal_mgpu_policy_stats_.offload_gpu_by_dev[dev_key]++;
+                    } else {
+                        g_ggml_metal_mgpu_policy_stats_.offload_mul_mat_id_cpu++;
+                        g_ggml_metal_mgpu_policy_stats_.offload_cpu_by_dev["CPU"]++;
+                    }
+                    break;
+                default:
+                    if (decision_yes) {
+                        g_ggml_metal_mgpu_policy_stats_.offload_other_gpu++;
+                        g_ggml_metal_mgpu_policy_stats_.offload_gpu_by_dev[dev_key]++;
+                    } else {
+                        g_ggml_metal_mgpu_policy_stats_.offload_other_cpu++;
+                        g_ggml_metal_mgpu_policy_stats_.offload_cpu_by_dev["CPU"]++;
+                    }
+                    break;
+            }
+        }
+    }
+
+    if (ggml_metal_env_mgpu_policy_log_()) {
+        fprintf(stderr,
+                "ggml-metal policy: stage=%s dev='%s' op=%s tensor='%s' bs=%lld ne=[%lld,%lld,%lld,%lld] decode_like=%d decode_strict=%d decode_small_mat=%d pp_small_batch=%d aux_batch=%lld decision=%s reason=%s\n",
+                stage ? stage : "(null)",
+                dev_name ? dev_name : "(unknown)",
+                ggml_metal_op_name_(op->op),
+                op->name[0] ? op->name : "(unnamed)",
+                (long long) bs,
+                (long long) op->ne[0],
+                (long long) op->ne[1],
+                (long long) op->ne[2],
+                (long long) op->ne[3],
+                (int) cls.is_decode_like,
+                (int) cls.is_decode_strict,
+                (int) cls.is_decode_small_mat,
+                (int) cls.is_pp_small_batch,
+                (long long) cls.aux_batch,
+                decision_yes ? "YES" : "NO",
+                reason ? reason : "(none)");
+    }
+}
 static int ggml_metal_env_mgpu_small_mat_offload_max_bs_(void) {
     const char * v = getenv("GGML_METAL_MGPU_SMALL_MAT_OFFLOAD_MAX_BS");
     if (v == NULL || v[0] == '\0') {
@@ -1164,6 +1400,12 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
                 ok ? "device-supports-op-yes" : "device-supports-op-no");
         }
 
+        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
+            const ggml_metal_decode_shape_class_ cls = ggml_metal_classify_decode_shape_(op);
+            ggml_metal_mgpu_policy_record_("supports_op", dev, op, bs, cls, ok,
+                ok ? "device-supports-op-yes" : "device-supports-op-no");
+        }
+
         return ok;
     }
 
@@ -1219,22 +1461,33 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
     const int64_t mul_mat_work_m = ggml_metal_mul_mat_work_m_(op);
     bool          small_mat_override = false;
 
+    ggml_metal_mgpu_policy_log_thresholds_(
+        dev,
+        offload_min_bs,
+        effective_offload_min_bs,
+        mgpu_decode_min_bs,
+        small_mat_offload_max_bs,
+        pp_dense_mul_mat_min_bs,
+        pp_dense_mul_mat_min_work_m,
+        mul_mat_work_m);
+
     // Limit this hook to matmul-like ops only.
     if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
         ggml_metal_log_offload_decision_(dev, op, bs, false, "unsupported-op-class");
+        ggml_metal_mgpu_policy_record_("offload_op", dev, op, bs, cls, false, "unsupported-op-class");
         return false;
     }
 
     // Single-GPU: preserve existing behavior for both MUL_MAT and MUL_MAT_ID.
     if (!is_mgpu) {
         const bool ok = bs >= offload_min_bs;
-        ggml_metal_log_offload_decision_(
-            dev, op, bs, ok,
-            ok
+        const char * reason = ok
             ? (cls.is_decode_strict ? "single-gpu-decode-strict-batch-ok"
                : cls.is_decode_small_mat ? "single-gpu-decode-small-mat-batch-ok"
                : "single-gpu-batch-ok")
-            : "single-gpu-batch-too-small");
+            : "single-gpu-batch-too-small";
+        ggml_metal_log_offload_decision_(dev, op, bs, ok, reason);
+        ggml_metal_mgpu_policy_record_("offload_op", dev, op, bs, cls, ok, reason);
         return ok;
     }
 
@@ -1266,9 +1519,9 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
             }
         }
     } else if (is_decode_like && bs <= mgpu_decode_min_bs) {
-        ggml_metal_log_offload_decision_(
-            dev, op, bs, false,
-            op->op == GGML_OP_MUL_MAT_ID ? "mgpu-mul_mat_id-decode-guard" : "mgpu-mul_mat-decode-guard");
+        const char * reason = op->op == GGML_OP_MUL_MAT_ID ? "mgpu-mul_mat_id-decode-guard" : "mgpu-mul_mat-decode-guard";
+        ggml_metal_log_offload_decision_(dev, op, bs, false, reason);
+        ggml_metal_mgpu_policy_record_("offload_op", dev, op, bs, cls, false, reason);
         return false;
     }
     
@@ -1320,18 +1573,20 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
     }
     if (bs < effective_offload_min_bs) {
         ggml_metal_log_offload_decision_(dev, op, bs, false, "device-offload-min-bs");
+        ggml_metal_mgpu_policy_record_("offload_op", dev, op, bs, cls, false, "device-offload-min-bs");
         return false;
     }
 
-    ggml_metal_log_offload_decision_(
-        dev, op, bs, true,
+    const char * reason =
         cls.is_decode_strict
             ? (op->op == GGML_OP_MUL_MAT_ID ? "mgpu-decode-strict-mul_mat_id" : "mgpu-decode-strict-mul_mat")
             : cls.is_decode_small_mat
                 ? (op->op == GGML_OP_MUL_MAT_ID ? "mgpu-decode-small-mat-mul_mat_id" : "mgpu-decode-small-mat-mul_mat")
                 : op->op == GGML_OP_MUL_MAT_ID
                     ? "mgpu-generic-mul_mat_id"
-                    : "mgpu-generic-mul_mat");
+                    : "mgpu-generic-mul_mat";
+    ggml_metal_log_offload_decision_(dev, op, bs, true, reason);
+    ggml_metal_mgpu_policy_record_("offload_op", dev, op, bs, cls, true, reason);
 
     return true;
 }
