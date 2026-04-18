@@ -12,6 +12,7 @@
 #import <Metal/Metal.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <dlfcn.h>
 #import "ggml-metal-context.h"
 
 // Obj-C (.m) friendly helper: no C++ 'auto', no blocks.
@@ -34,6 +35,250 @@ static inline const char * ggml_metal_cmd_status_name(MTLCommandBufferStatus s) 
 
 // max number of MTLCommandBuffer used to submit a graph for processing
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
+
+
+static inline bool ggml_metal_trace_copy_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = (getenv("GGML_METAL_TRACE_COPY") != NULL || getenv("GGML_METAL_MGPU_TRACE_COPY") != NULL) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+
+static inline bool ggml_metal_hot_tensor_name(const char * name) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    return strcmp(name, "result_output") == 0 || strcmp(name, "embd") == 0 || strncmp(name, "l_out-", 6) == 0 || strcmp(name, " (copy)") == 0 || strncmp(name, "Metal#l_out-", 12) == 0 || strcmp(name, "Metal#embd#0") == 0 || strcmp(name, "Metal# (copy)#0") == 0;
+}
+
+enum { GGML_METAL_TRACE_CALLSITE_MAX = 128 };
+static char     g_trace_callsite_tensor[GGML_METAL_TRACE_CALLSITE_MAX][64];
+static char     g_trace_callsite_kind[GGML_METAL_TRACE_CALLSITE_MAX][24];
+static char     g_trace_callsite_sym[GGML_METAL_TRACE_CALLSITE_MAX][128];
+static uint64_t g_trace_callsite_calls[GGML_METAL_TRACE_CALLSITE_MAX];
+static uint64_t g_trace_callsite_bytes[GGML_METAL_TRACE_CALLSITE_MAX];
+static pthread_mutex_t g_trace_callsite_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static inline const char * ggml_metal_trace_callsite_symbol(void * ra, char * buf, size_t buf_size) {
+    if (!buf || buf_size == 0) {
+        return "";
+    }
+    buf[0] = '\0';
+    if (!ra) {
+        snprintf(buf, buf_size, "<null>");
+        return buf;
+    }
+    Dl_info info;
+    if (dladdr(ra, &info) && info.dli_sname && info.dli_sname[0]) {
+        snprintf(buf, buf_size, "%s", info.dli_sname);
+        return buf;
+    }
+    snprintf(buf, buf_size, "%p", ra);
+    return buf;
+}
+
+static void ggml_metal_trace_callsite_record(const char * kind, const char * tensor_name, size_t size, void * ra) {
+    if (!ggml_metal_trace_copy_enabled() || !ggml_metal_hot_tensor_name(tensor_name)) {
+        return;
+    }
+
+    char sym[128];
+    ggml_metal_trace_callsite_symbol(ra, sym, sizeof(sym));
+
+    GGML_LOG_INFO("ggml-metal: trace-hot-callsite: kind=%s tensor='%s' bytes=%zu caller=%s\n",
+        kind ? kind : "",
+        tensor_name ? tensor_name : "",
+        size,
+        sym);
+
+    pthread_mutex_lock(&g_trace_callsite_mutex);
+    int free_slot = -1;
+    for (int i = 0; i < GGML_METAL_TRACE_CALLSITE_MAX; ++i) {
+        if (g_trace_callsite_tensor[i][0] == '\0') {
+            if (free_slot < 0) {
+                free_slot = i;
+            }
+            continue;
+        }
+        if (strncmp(g_trace_callsite_tensor[i], tensor_name ? tensor_name : "", sizeof(g_trace_callsite_tensor[i])) == 0 &&
+            strncmp(g_trace_callsite_kind[i], kind ? kind : "", sizeof(g_trace_callsite_kind[i])) == 0 &&
+            strncmp(g_trace_callsite_sym[i], sym, sizeof(g_trace_callsite_sym[i])) == 0) {
+            g_trace_callsite_calls[i] += 1;
+            g_trace_callsite_bytes[i] += size;
+            pthread_mutex_unlock(&g_trace_callsite_mutex);
+            return;
+        }
+    }
+    if (free_slot >= 0) {
+        snprintf(g_trace_callsite_tensor[free_slot], sizeof(g_trace_callsite_tensor[free_slot]), "%s", tensor_name ? tensor_name : "");
+        snprintf(g_trace_callsite_kind[free_slot], sizeof(g_trace_callsite_kind[free_slot]), "%s", kind ? kind : "");
+        snprintf(g_trace_callsite_sym[free_slot], sizeof(g_trace_callsite_sym[free_slot]), "%s", sym);
+        g_trace_callsite_calls[free_slot] = 1;
+        g_trace_callsite_bytes[free_slot] = size;
+    }
+    pthread_mutex_unlock(&g_trace_callsite_mutex);
+}
+
+static void ggml_metal_trace_callsite_summary(void) {
+    if (!ggml_metal_trace_copy_enabled()) {
+        return;
+    }
+    for (int rank = 0; rank < 10; ++rank) {
+        int best = -1;
+        for (int i = 0; i < GGML_METAL_TRACE_CALLSITE_MAX; ++i) {
+            if (g_trace_callsite_tensor[i][0] == '\0') {
+                continue;
+            }
+            if (best < 0 || g_trace_callsite_bytes[i] > g_trace_callsite_bytes[best]) {
+                best = i;
+            }
+        }
+        if (best < 0 || g_trace_callsite_bytes[best] == 0) {
+            break;
+        }
+        GGML_LOG_INFO("ggml-metal: trace-hot-callsite-summary: rank=%d kind=%s tensor='%s' caller=%s calls=%llu bytes=%llu\n",
+            rank + 1,
+            g_trace_callsite_kind[best],
+            g_trace_callsite_tensor[best],
+            g_trace_callsite_sym[best],
+            (unsigned long long) g_trace_callsite_calls[best],
+            (unsigned long long) g_trace_callsite_bytes[best]);
+        g_trace_callsite_tensor[best][0] = '\0';
+    }
+}
+
+
+
+enum { GGML_METAL_TRACE_HOT_SEQ_MAX = 64 };
+static char     g_trace_hot_seq_tensor[GGML_METAL_TRACE_HOT_SEQ_MAX][64];
+static char     g_trace_hot_seq_kind[GGML_METAL_TRACE_HOT_SEQ_MAX][24];
+static uint64_t g_trace_hot_seq_calls[GGML_METAL_TRACE_HOT_SEQ_MAX];
+static uint64_t g_trace_hot_seq_bytes[GGML_METAL_TRACE_HOT_SEQ_MAX];
+static pthread_mutex_t g_trace_hot_seq_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void ggml_metal_trace_hot_seq_record(const char * kind, const char * tensor_name, size_t size) {
+    if (!ggml_metal_trace_copy_enabled() || !ggml_metal_hot_tensor_name(tensor_name)) {
+        return;
+    }
+
+    uint64_t calls = 0;
+    uint64_t total_bytes = 0;
+
+    pthread_mutex_lock(&g_trace_hot_seq_mutex);
+    int free_slot = -1;
+    for (int i = 0; i < GGML_METAL_TRACE_HOT_SEQ_MAX; ++i) {
+        if (g_trace_hot_seq_tensor[i][0] == '\0') {
+            if (free_slot < 0) {
+                free_slot = i;
+            }
+            continue;
+        }
+        if (strncmp(g_trace_hot_seq_tensor[i], tensor_name ? tensor_name : "", sizeof(g_trace_hot_seq_tensor[i])) == 0 &&
+            strncmp(g_trace_hot_seq_kind[i], kind ? kind : "", sizeof(g_trace_hot_seq_kind[i])) == 0) {
+            g_trace_hot_seq_calls[i] += 1;
+            g_trace_hot_seq_bytes[i] += size;
+            calls = g_trace_hot_seq_calls[i];
+            total_bytes = g_trace_hot_seq_bytes[i];
+            pthread_mutex_unlock(&g_trace_hot_seq_mutex);
+            GGML_LOG_INFO("ggml-metal: trace-hot-seq: kind=%s tensor='%s' call=%llu bytes=%zu total_bytes=%llu\n",
+                kind ? kind : "",
+                tensor_name ? tensor_name : "",
+                (unsigned long long) calls,
+                size,
+                (unsigned long long) total_bytes);
+            return;
+        }
+    }
+    if (free_slot >= 0) {
+        snprintf(g_trace_hot_seq_tensor[free_slot], sizeof(g_trace_hot_seq_tensor[free_slot]), "%s", tensor_name ? tensor_name : "");
+        snprintf(g_trace_hot_seq_kind[free_slot], sizeof(g_trace_hot_seq_kind[free_slot]), "%s", kind ? kind : "");
+        g_trace_hot_seq_calls[free_slot] = 1;
+        g_trace_hot_seq_bytes[free_slot] = size;
+        calls = 1;
+        total_bytes = size;
+    }
+    pthread_mutex_unlock(&g_trace_hot_seq_mutex);
+    GGML_LOG_INFO("ggml-metal: trace-hot-seq: kind=%s tensor='%s' call=%llu bytes=%zu total_bytes=%llu\n",
+        kind ? kind : "",
+        tensor_name ? tensor_name : "",
+        (unsigned long long) calls,
+        size,
+        (unsigned long long) total_bytes);
+}
+
+static void ggml_metal_trace_hot_seq_summary(void) {
+    if (!ggml_metal_trace_copy_enabled()) {
+        return;
+    }
+    for (int rank = 0; rank < 10; ++rank) {
+        int best = -1;
+        for (int i = 0; i < GGML_METAL_TRACE_HOT_SEQ_MAX; ++i) {
+            if (g_trace_hot_seq_tensor[i][0] == '\0') {
+                continue;
+            }
+            if (best < 0 || g_trace_hot_seq_bytes[i] > g_trace_hot_seq_bytes[best]) {
+                best = i;
+            }
+        }
+        if (best < 0 || g_trace_hot_seq_bytes[best] == 0) {
+            break;
+        }
+        GGML_LOG_INFO("ggml-metal: trace-hot-seq-summary: rank=%d kind=%s tensor='%s' calls=%llu bytes=%llu\n",
+            rank + 1,
+            g_trace_hot_seq_kind[best],
+            g_trace_hot_seq_tensor[best],
+            (unsigned long long) g_trace_hot_seq_calls[best],
+            (unsigned long long) g_trace_hot_seq_bytes[best]);
+        g_trace_hot_seq_tensor[best][0] = '\0';
+    }
+}
+
+static inline const char * ggml_metal_buf_label(id<MTLBuffer> buf) {
+    if (buf == nil) {
+        return "";
+    }
+    NSString * label = [buf label];
+    return label ? [label UTF8String] : "";
+}
+
+#define GGML_METAL_TRACE_BUCKETS 7
+#define GGML_METAL_TRACE_TOP_TENSORS 32
+#define GGML_METAL_TRACE_NAME_MAX 64
+
+static inline int ggml_metal_trace_size_bucket(size_t size) {
+    if (size <= 4*1024)      return 0;
+    if (size <= 16*1024)     return 1;
+    if (size <= 64*1024)     return 2;
+    if (size <= 256*1024)    return 3;
+    if (size <= 1024*1024)   return 4;
+    if (size <= 4*1024*1024) return 5;
+    return 6;
+}
+
+static inline const char * ggml_metal_trace_bucket_name(int b) {
+    switch (b) {
+        case 0: return "le4k";
+        case 1: return "4k_16k";
+        case 2: return "16k_64k";
+        case 3: return "64k_256k";
+        case 4: return "256k_1m";
+        case 5: return "1m_4m";
+        default: return "gt4m";
+    }
+}
+
+static inline int ggml_metal_trace_kind_index(const char * kind) {
+    if (kind && strcmp(kind, "set_tensor_async") == 0) {
+        return 0;
+    }
+    if (kind && strcmp(kind, "get_tensor_async") == 0) {
+        return 1;
+    }
+    return 2;
+}
+
 
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
@@ -89,10 +334,149 @@ struct ggml_metal {
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
 
+    // V5.1 Metal copy/sync tracing
+    bool     trace_copy_enable;
+    uint64_t trace_copy_blit_calls;
+    uint64_t trace_copy_blit_bytes;
+    uint64_t trace_copy_cross_dev_calls;
+    uint64_t trace_copy_cross_dev_bytes;
+    uint64_t trace_copy_sync_waits;
+    uint64_t trace_copy_cmd_commits;
+    uint64_t trace_copy_buffer_allocs;
+    uint64_t trace_copy_buffer_alloc_bytes;
+    uint64_t trace_copy_blit_calls_by_kind[3];
+    uint64_t trace_copy_blit_bytes_by_kind[3];
+    uint64_t trace_copy_blit_bucket_calls[GGML_METAL_TRACE_BUCKETS];
+    uint64_t trace_copy_blit_bucket_bytes[GGML_METAL_TRACE_BUCKETS];
+    uint64_t trace_copy_tensor_calls[GGML_METAL_TRACE_TOP_TENSORS];
+    uint64_t trace_copy_tensor_bytes[GGML_METAL_TRACE_TOP_TENSORS];
+    uint8_t  trace_copy_tensor_kind[GGML_METAL_TRACE_TOP_TENSORS];
+    char     trace_copy_tensor_name[GGML_METAL_TRACE_TOP_TENSORS][GGML_METAL_TRACE_NAME_MAX];
+
     // abort ggml_metal_graph_compute if callback returns true
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
 };
+
+static inline const char * ggml_metal_trace_tensor_name(const char * name) {
+    if (name == NULL || name[0] == '\0') {
+        return "(unnamed)";
+    }
+    return name;
+}
+
+static inline void ggml_metal_trace_tensor_accum(ggml_metal_t ctx, const char * kind, const char * tensor_name, size_t size) {
+    if (ctx == NULL) {
+        return;
+    }
+    const int k = ggml_metal_trace_kind_index(kind);
+    const char * safe = ggml_metal_trace_tensor_name(tensor_name);
+
+    for (int i = 0; i < GGML_METAL_TRACE_TOP_TENSORS; ++i) {
+        if (ctx->trace_copy_tensor_name[i][0] != '\0' &&
+            ctx->trace_copy_tensor_kind[i] == (uint8_t) k &&
+            strncmp(ctx->trace_copy_tensor_name[i], safe, GGML_METAL_TRACE_NAME_MAX) == 0) {
+            ctx->trace_copy_tensor_calls[i] += 1;
+            ctx->trace_copy_tensor_bytes[i] += size;
+            return;
+        }
+    }
+
+    for (int i = 0; i < GGML_METAL_TRACE_TOP_TENSORS; ++i) {
+        if (ctx->trace_copy_tensor_name[i][0] == '\0') {
+            strncpy(ctx->trace_copy_tensor_name[i], safe, GGML_METAL_TRACE_NAME_MAX - 1);
+            ctx->trace_copy_tensor_name[i][GGML_METAL_TRACE_NAME_MAX - 1] = '\0';
+            ctx->trace_copy_tensor_kind[i] = (uint8_t) k;
+            ctx->trace_copy_tensor_calls[i] = 1;
+            ctx->trace_copy_tensor_bytes[i] = size;
+            return;
+        }
+    }
+
+    int min_i = 0;
+    for (int i = 1; i < GGML_METAL_TRACE_TOP_TENSORS; ++i) {
+        if (ctx->trace_copy_tensor_bytes[i] < ctx->trace_copy_tensor_bytes[min_i]) {
+            min_i = i;
+        }
+    }
+    if (size > ctx->trace_copy_tensor_bytes[min_i]) {
+        strncpy(ctx->trace_copy_tensor_name[min_i], safe, GGML_METAL_TRACE_NAME_MAX - 1);
+        ctx->trace_copy_tensor_name[min_i][GGML_METAL_TRACE_NAME_MAX - 1] = '\0';
+        ctx->trace_copy_tensor_kind[min_i] = (uint8_t) k;
+        ctx->trace_copy_tensor_calls[min_i] = 1;
+        ctx->trace_copy_tensor_bytes[min_i] = size;
+    }
+}
+
+static inline const char * ggml_metal_trace_kind_name_from_index(int k) {
+    switch (k) {
+        case 0: return "set_tensor_async";
+        case 1: return "get_tensor_async";
+        default: return "other";
+    }
+}
+
+static inline void ggml_metal_trace_emit_top_tensors(ggml_metal_t ctx) {
+    uint64_t bytes[GGML_METAL_TRACE_TOP_TENSORS];
+    uint64_t calls[GGML_METAL_TRACE_TOP_TENSORS];
+    uint8_t  kind[GGML_METAL_TRACE_TOP_TENSORS];
+    char     names[GGML_METAL_TRACE_TOP_TENSORS][GGML_METAL_TRACE_NAME_MAX];
+    memcpy(bytes, ctx->trace_copy_tensor_bytes, sizeof(bytes));
+    memcpy(calls, ctx->trace_copy_tensor_calls, sizeof(calls));
+    memcpy(kind,  ctx->trace_copy_tensor_kind,  sizeof(kind));
+    memcpy(names, ctx->trace_copy_tensor_name,  sizeof(names));
+
+    for (int rank = 0; rank < 10; ++rank) {
+        int best = -1;
+        for (int i = 0; i < GGML_METAL_TRACE_TOP_TENSORS; ++i) {
+            if (names[i][0] == '\0') {
+                continue;
+            }
+            if (best < 0 || bytes[i] > bytes[best]) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        GGML_LOG_INFO("ggml-metal: trace-top-tensor: rank=%d kind=%s name='%s' calls=%llu bytes=%llu\n",
+            rank + 1,
+            ggml_metal_trace_kind_name_from_index(kind[best]),
+            names[best],
+            (unsigned long long) calls[best],
+            (unsigned long long) bytes[best]);
+        names[best][0] = '\0';
+    }
+
+    ggml_metal_trace_callsite_summary();
+    ggml_metal_trace_hot_seq_summary();
+}
+
+static inline void ggml_metal_trace_blit(ggml_metal_t ctx, const char * tag, const char * kind, const char * tensor_name, id<MTLBuffer> src, id<MTLBuffer> dst, size_t src_off, size_t dst_off, size_t size) {
+    if (!ggml_metal_trace_copy_enabled()) {
+        return;
+    }
+    const char * src_dev = src ? [[[src device] name] UTF8String] : "";
+    const char * dst_dev = dst ? [[[dst device] name] UTF8String] : "";
+    GGML_LOG_INFO("ggml-metal: %s: kind=%s tensor='%s' src_buf=%p dst_buf=%p src_dev=%s dst_dev=%s src_label='%s' dst_label='%s' src_off=%zu dst_off=%zu size=%zu bucket=%s\n",
+        tag, kind ? kind : "unknown", ggml_metal_trace_tensor_name(tensor_name), (void *) src, (void *) dst, src_dev, dst_dev, ggml_metal_buf_label(src), ggml_metal_buf_label(dst), src_off, dst_off, size, ggml_metal_trace_bucket_name(ggml_metal_trace_size_bucket(size)));
+    if (ctx) {
+        const int b = ggml_metal_trace_size_bucket(size);
+        const int k = ggml_metal_trace_kind_index(kind);
+        ctx->trace_copy_blit_calls += 1;
+        ctx->trace_copy_blit_bytes += size;
+        ctx->trace_copy_blit_bucket_calls[b] += 1;
+        ctx->trace_copy_blit_bucket_bytes[b] += size;
+        ctx->trace_copy_blit_calls_by_kind[k] += 1;
+        ctx->trace_copy_blit_bytes_by_kind[k] += size;
+        ggml_metal_trace_tensor_accum(ctx, kind, tensor_name, size);
+        if (src && dst && [src device] != [dst device]) {
+            ctx->trace_copy_cross_dev_calls += 1;
+            ctx->trace_copy_cross_dev_bytes += size;
+        }
+    }
+}
+
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
@@ -181,6 +565,24 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     res->decode_stats_commits    = 0;
     res->decode_stats_nodes_total = 0;
 
+    res->trace_copy_enable = ggml_metal_trace_copy_enabled();
+    res->trace_copy_blit_calls = 0;
+    res->trace_copy_blit_bytes = 0;
+    res->trace_copy_cross_dev_calls = 0;
+    res->trace_copy_cross_dev_bytes = 0;
+    res->trace_copy_sync_waits = 0;
+    res->trace_copy_cmd_commits = 0;
+    res->trace_copy_buffer_allocs = 0;
+    res->trace_copy_buffer_alloc_bytes = 0;
+    memset(res->trace_copy_blit_calls_by_kind, 0, sizeof(res->trace_copy_blit_calls_by_kind));
+    memset(res->trace_copy_blit_bytes_by_kind, 0, sizeof(res->trace_copy_blit_bytes_by_kind));
+    memset(res->trace_copy_blit_bucket_calls, 0, sizeof(res->trace_copy_blit_bucket_calls));
+    memset(res->trace_copy_blit_bucket_bytes, 0, sizeof(res->trace_copy_blit_bucket_bytes));
+    memset(res->trace_copy_tensor_calls, 0, sizeof(res->trace_copy_tensor_calls));
+    memset(res->trace_copy_tensor_bytes, 0, sizeof(res->trace_copy_tensor_bytes));
+    memset(res->trace_copy_tensor_kind, 0, sizeof(res->trace_copy_tensor_kind));
+    memset(res->trace_copy_tensor_name, 0, sizeof(res->trace_copy_tensor_name));
+
     // Graph optimizer toggle (default ON)
     res->use_graph_optimize = true;
     if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
@@ -202,6 +604,32 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+    if (ctx->trace_copy_enable) {
+        GGML_LOG_INFO("ggml-metal: trace-summary: blit_calls=%llu blit_bytes=%llu cross_dev_calls=%llu cross_dev_bytes=%llu sync_waits=%llu cmd_commits=%llu buffer_allocs=%llu buffer_alloc_bytes=%llu\n",
+            (unsigned long long) ctx->trace_copy_blit_calls,
+            (unsigned long long) ctx->trace_copy_blit_bytes,
+            (unsigned long long) ctx->trace_copy_cross_dev_calls,
+            (unsigned long long) ctx->trace_copy_cross_dev_bytes,
+            (unsigned long long) ctx->trace_copy_sync_waits,
+            (unsigned long long) ctx->trace_copy_cmd_commits,
+            (unsigned long long) ctx->trace_copy_buffer_allocs,
+            (unsigned long long) ctx->trace_copy_buffer_alloc_bytes);
+        GGML_LOG_INFO("ggml-metal: trace-kind-summary: set_calls=%llu set_bytes=%llu get_calls=%llu get_bytes=%llu other_calls=%llu other_bytes=%llu\n",
+            (unsigned long long) ctx->trace_copy_blit_calls_by_kind[0],
+            (unsigned long long) ctx->trace_copy_blit_bytes_by_kind[0],
+            (unsigned long long) ctx->trace_copy_blit_calls_by_kind[1],
+            (unsigned long long) ctx->trace_copy_blit_bytes_by_kind[1],
+            (unsigned long long) ctx->trace_copy_blit_calls_by_kind[2],
+            (unsigned long long) ctx->trace_copy_blit_bytes_by_kind[2]);
+        for (int bi = 0; bi < GGML_METAL_TRACE_BUCKETS; ++bi) {
+            GGML_LOG_INFO("ggml-metal: trace-bucket-summary: bucket=%s calls=%llu bytes=%llu\n",
+                ggml_metal_trace_bucket_name(bi),
+                (unsigned long long) ctx->trace_copy_blit_bucket_calls[bi],
+                (unsigned long long) ctx->trace_copy_blit_bucket_bytes[bi]);
+        }
+        ggml_metal_trace_emit_top_tensors(ctx);
+    }
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -249,6 +677,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
     if (ctx->cmd_buf_last) {
         const MTLCommandBufferStatus status = [ctx->cmd_buf_last status];
         if (status != MTLCommandBufferStatusNotEnqueued && status != MTLCommandBufferStatusCompleted) {
+            if (ctx->trace_copy_enable) {
+                ctx->trace_copy_sync_waits += 1;
+                GGML_LOG_INFO("ggml-metal: cmd-buffer-wait: scope=cmd_buf_last cmd=%p status=%s\n", (void *) ctx->cmd_buf_last, ggml_metal_cmd_status_name(status));
+            }
             [ctx->cmd_buf_last waitUntilCompleted];
         }
         ctx->cmd_buf_last = nil;
@@ -269,6 +701,14 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
 
             if (status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: cb[%d]=%p status(before)=%d(%s)\n", __func__, cb_idx, (void *) cmd_buf, (int) status, ggml_metal_cmd_status_name(status));
+                if (ctx->trace_copy_enable) {
+                    ctx->trace_copy_sync_waits += 1;
+                    GGML_LOG_INFO("ggml-metal: cmd-buffer-wait: scope=cb[%d] cmd=%p status=%s\n", cb_idx, (void *) cmd_buf, ggml_metal_cmd_status_name(status));
+                }
+                if (ctx->trace_copy_enable) {
+                    ctx->trace_copy_sync_waits += 1;
+                    GGML_LOG_INFO("ggml-metal: cmd-buffer-wait: scope=cb[%d]-ext cmd=%p status=%s\n", cb_idx, (void *) cmd_buf, ggml_metal_cmd_status_name(status));
+                }
                 [cmd_buf waitUntilCompleted];
                 status = [cmd_buf status];
                 GGML_LOG_ERROR("%s: cb[%d]=%p status(after) =%d(%s)\n", __func__, cb_idx, (void *) cmd_buf, (int) status, ggml_metal_cmd_status_name(status));
@@ -357,6 +797,12 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
                                                         options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_src);
+        if (ctx->trace_copy_enable) {
+            ctx->trace_copy_buffer_allocs += 1;
+            ctx->trace_copy_buffer_alloc_bytes += size;
+            GGML_LOG_INFO("ggml-metal: buffer-alloc: kind=set_tensor_async bytes=%zu storage=%u buf=%p dev=%s\n",
+                size, (unsigned) MTLResourceStorageModeShared, (void *) buf_src, [[device name] UTF8String]);
+        }
 
         struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(tensor);
         if (bid_dst.metal == nil) {
@@ -375,7 +821,13 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        if (ctx->trace_copy_enable) {
+            GGML_LOG_INFO("ggml-metal: cmd-buffer-create: scope=set_tensor_async cmd=%p\n", (void *) cmd_buf);
+        }
 
+        ggml_metal_trace_callsite_record("set_tensor_async", tensor ? tensor->name : "", size, __builtin_return_address(0));
+        ggml_metal_trace_hot_seq_record("set_tensor_async", tensor ? tensor->name : "", size);
+        ggml_metal_trace_blit(ctx, "blit-copy", "set_tensor_async", tensor ? tensor->name : "", buf_src, bid_dst.metal, 0, bid_dst.offs, size);
         [encoder copyFromBuffer:buf_src
                    sourceOffset:0
                        toBuffer:bid_dst.metal
@@ -383,6 +835,10 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
                            size:size];
 
         [encoder endEncoding];
+        if (ctx->trace_copy_enable) {
+            ctx->trace_copy_cmd_commits += 1;
+            GGML_LOG_INFO("ggml-metal: cmd-buffer-commit: scope=set_tensor_async cmd=%p\n", (void *) cmd_buf);
+        }
         [cmd_buf commit];
         [buf_src release];
 
@@ -406,6 +862,12 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
                                                           deallocator:nil];
 
         GGML_ASSERT(buf_dst);
+        if (ctx->trace_copy_enable) {
+            ctx->trace_copy_buffer_allocs += 1;
+            ctx->trace_copy_buffer_alloc_bytes += size;
+            GGML_LOG_INFO("ggml-metal: buffer-alloc: kind=get_tensor_async bytes=%zu storage=%u buf=%p dev=%s\n",
+                size, (unsigned) MTLResourceStorageModeShared, (void *) buf_dst, [[device name] UTF8String]);
+        }
 
         struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
         if (bid_src.metal == nil) {
@@ -419,7 +881,13 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        if (ctx->trace_copy_enable) {
+            GGML_LOG_INFO("ggml-metal: cmd-buffer-create: scope=get_tensor_async cmd=%p\n", (void *) cmd_buf);
+        }
 
+        ggml_metal_trace_callsite_record("get_tensor_async", tensor ? tensor->name : "", size, __builtin_return_address(0));
+        ggml_metal_trace_hot_seq_record("get_tensor_async", tensor ? tensor->name : "", size);
+        ggml_metal_trace_blit(ctx, "blit-copy", "get_tensor_async", tensor ? tensor->name : "", bid_src.metal, buf_dst, bid_src.offs, 0, size);
         [encoder copyFromBuffer:bid_src.metal
                    sourceOffset:bid_src.offs
                        toBuffer:buf_dst
@@ -427,6 +895,10 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
                            size:size];
 
         [encoder endEncoding];
+        if (ctx->trace_copy_enable) {
+            ctx->trace_copy_cmd_commits += 1;
+            GGML_LOG_INFO("ggml-metal: cmd-buffer-commit: scope=get_tensor_async cmd=%p\n", (void *) cmd_buf);
+        }
         [cmd_buf commit];
         [buf_dst release];
 

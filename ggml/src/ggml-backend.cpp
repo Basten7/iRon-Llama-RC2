@@ -202,10 +202,43 @@ void ggml_backend_buffer_reset(ggml_backend_buffer_t buffer) {
     }
 }
 
+static inline bool ggml_backend_trace_copy_enabled_();
+static inline const char * ggml_backend_buffer_name_safe_(ggml_backend_buffer_t buffer);
+
 bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (ggml_backend_trace_copy_enabled_()) {
+        GGML_LOG_INFO(
+            "ggml-backend: real-copy-buffer-enter: src_buf=%s dst_buf=%s src='%s' dst='%s' bytes=%zu dst_has_cpy_tensor=%d\n",
+            src && src->buffer ? ggml_backend_buffer_name_safe_(src->buffer) : "",
+            ggml_backend_buffer_name_safe_(dst_buf),
+            src ? src->name : "",
+            dst ? dst->name : "",
+            src ? ggml_nbytes(src) : 0,
+            dst_buf && dst_buf->iface.cpy_tensor ? 1 : 0);
+    }
     if (dst_buf->iface.cpy_tensor) {
-        return dst_buf->iface.cpy_tensor(dst_buf, src, dst);
+        const bool ok = dst_buf->iface.cpy_tensor(dst_buf, src, dst);
+        if (ggml_backend_trace_copy_enabled_()) {
+            GGML_LOG_INFO(
+                "ggml-backend: real-copy-buffer-exit: mode=buffer-cpy-tensor ok=%d src_buf=%s dst_buf=%s src='%s' dst='%s' bytes=%zu\n",
+                ok ? 1 : 0,
+                src && src->buffer ? ggml_backend_buffer_name_safe_(src->buffer) : "",
+                ggml_backend_buffer_name_safe_(dst_buf),
+                src ? src->name : "",
+                dst ? dst->name : "",
+                src ? ggml_nbytes(src) : 0);
+        }
+        return ok;
+    }
+    if (ggml_backend_trace_copy_enabled_()) {
+        GGML_LOG_INFO(
+            "ggml-backend: real-copy-buffer-exit: mode=buffer-cpy-tensor ok=0 src_buf=%s dst_buf=%s src='%s' dst='%s' bytes=%zu reason=iface-null\n",
+            src && src->buffer ? ggml_backend_buffer_name_safe_(src->buffer) : "",
+            ggml_backend_buffer_name_safe_(dst_buf),
+            src ? src->name : "",
+            dst ? dst->name : "",
+            src ? ggml_nbytes(src) : 0);
     }
     return false;
 }
@@ -386,6 +419,10 @@ static inline void ggml_backend_trace_sync_(
         extra ? extra : "");
 }
 
+static inline const char * ggml_backend_buffer_name_safe_(ggml_backend_buffer_t buffer) {
+    return buffer ? ggml_backend_buffer_name(buffer) : "";
+}
+
 static inline void ggml_backend_trace_copy_(
         const char * stage,
         ggml_backend_t backend_src,
@@ -483,22 +520,66 @@ void ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
+        if (ggml_backend_trace_copy_enabled_()) {
+            GGML_LOG_INFO("ggml-backend: real-copy: mode=self-skip src='%s' dst='%s' bytes=%zu\n", src ? src->name : "", dst ? dst->name : "", src ? ggml_nbytes(src) : 0);
+        }
         return;
     }
 
+    if (ggml_backend_trace_copy_enabled_()) {
+        GGML_LOG_INFO(
+            "ggml-backend: real-copy-enter: src_buf=%s dst_buf=%s src='%s' dst='%s' bytes=%zu src_host=%d dst_host=%d\n",
+            src && src->buffer ? ggml_backend_buffer_name_safe_(src->buffer) : "",
+            dst && dst->buffer ? ggml_backend_buffer_name_safe_(dst->buffer) : "",
+            src ? src->name : "",
+            dst ? dst->name : "",
+            src ? ggml_nbytes(src) : 0,
+            src && src->buffer && ggml_backend_buffer_is_host(src->buffer) ? 1 : 0,
+            dst && dst->buffer && ggml_backend_buffer_is_host(dst->buffer) ? 1 : 0);
+    }
+
     if (ggml_backend_buffer_is_host(src->buffer)) {
+        if (ggml_backend_trace_copy_enabled_()) {
+            GGML_LOG_INFO("ggml-backend: real-copy-path: mode=host-to-device src='%s' dst='%s' bytes=%zu\n", src ? src->name : "", dst ? dst->name : "", ggml_nbytes(src));
+        }
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
     } else if (ggml_backend_buffer_is_host(dst->buffer)) {
+        if (ggml_backend_trace_copy_enabled_()) {
+            GGML_LOG_INFO("ggml-backend: real-copy-path: mode=device-to-host src='%s' dst='%s' bytes=%zu\n", src ? src->name : "", dst ? dst->name : "", ggml_nbytes(src));
+        }
         ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
     } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
 #endif
         size_t nbytes = ggml_nbytes(src);
+        if (ggml_backend_trace_copy_enabled_()) {
+            GGML_LOG_INFO(
+                "ggml-backend: real-copy-path: mode=slow-fallback src_buf=%s dst_buf=%s src='%s' dst='%s' bytes=%zu\n",
+                src && src->buffer ? ggml_backend_buffer_name_safe_(src->buffer) : "",
+                dst && dst->buffer ? ggml_backend_buffer_name_safe_(dst->buffer) : "",
+                src ? src->name : "",
+                dst ? dst->name : "",
+                nbytes);
+        }
         void * data = malloc(nbytes);
         ggml_backend_tensor_get(src, data, 0, nbytes);
         ggml_backend_tensor_set(dst, data, 0, nbytes);
         free(data);
+    } else {
+        if (ggml_backend_trace_copy_enabled_()) {
+            GGML_LOG_INFO(
+                "ggml-backend: real-copy-path: mode=device-to-device-fast src_buf=%s dst_buf=%s src='%s' dst='%s' bytes=%zu\n",
+                src && src->buffer ? ggml_backend_buffer_name_safe_(src->buffer) : "",
+                dst && dst->buffer ? ggml_backend_buffer_name_safe_(dst->buffer) : "",
+                src ? src->name : "",
+                dst ? dst->name : "",
+                ggml_nbytes(src));
+        }
+    }
+
+    if (ggml_backend_trace_copy_enabled_()) {
+        GGML_LOG_INFO("ggml-backend: real-copy-exit: src='%s' dst='%s' bytes=%zu\n", src ? src->name : "", dst ? dst->name : "", src ? ggml_nbytes(src) : 0);
     }
 }
 
@@ -506,14 +587,48 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
     if (src == dst) {
+        if (ggml_backend_trace_copy_enabled_()) {
+            GGML_LOG_INFO("ggml-backend: real-copy-async: mode=self-skip src='%s' dst='%s' bytes=%zu\n", src ? src->name : "", dst ? dst->name : "", src ? ggml_nbytes(src) : 0);
+        }
         return;
     }
 
     GGML_ASSERT(backend_dst);
+    if (ggml_backend_trace_copy_enabled_()) {
+        GGML_LOG_INFO(
+            "ggml-backend: real-copy-async-enter: src_backend=%s dst_backend=%s src='%s' dst='%s' bytes=%zu has_async=%d\n",
+            backend_src ? ggml_backend_name(backend_src) : "",
+            backend_dst ? ggml_backend_name(backend_dst) : "",
+            src ? src->name : "",
+            dst ? dst->name : "",
+            src ? ggml_nbytes(src) : 0,
+            backend_dst->iface.cpy_tensor_async != NULL ? 1 : 0);
+    }
     if (backend_dst->iface.cpy_tensor_async != NULL) {
-        if (backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
+        const bool ok = backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst);
+        if (ggml_backend_trace_copy_enabled_()) {
+            GGML_LOG_INFO(
+                "ggml-backend: real-copy-async-try: ok=%d src_backend=%s dst_backend=%s src='%s' dst='%s' bytes=%zu\n",
+                ok ? 1 : 0,
+                backend_src ? ggml_backend_name(backend_src) : "",
+                backend_dst ? ggml_backend_name(backend_dst) : "",
+                src ? src->name : "",
+                dst ? dst->name : "",
+                src ? ggml_nbytes(src) : 0);
+        }
+        if (ok) {
             return;
         }
+    }
+
+    if (ggml_backend_trace_copy_enabled_()) {
+        GGML_LOG_INFO(
+            "ggml-backend: real-copy-async-fallback: src_backend=%s dst_backend=%s src='%s' dst='%s' bytes=%zu\n",
+            backend_src ? ggml_backend_name(backend_src) : "",
+            backend_dst ? ggml_backend_name(backend_dst) : "",
+            src ? src->name : "",
+            dst ? dst->name : "",
+            src ? ggml_nbytes(src) : 0);
     }
 
     // an async copy would normally happen after all the queued operations on both backends are completed
@@ -1006,6 +1121,46 @@ static inline bool ggml_backend_sched_trace_copy_enabled_() {
     return s && s[0] && atoi(s) != 0;
 }
 
+static inline void ggml_backend_sched_trace_marker_(
+        ggml_backend_sched_t sched,
+        const char * marker,
+        int split_id,
+        int dst_backend_id,
+        int src_backend_id,
+        const struct ggml_tensor * src,
+        const struct ggml_tensor * dst,
+        size_t nbytes,
+        const char * extra) {
+    if (!ggml_backend_sched_trace_copy_enabled_()) {
+        return;
+    }
+
+    const char * src_backend_name = "";
+    const char * dst_backend_name = "";
+
+    if (sched != NULL) {
+        if (src_backend_id >= 0 && src_backend_id < sched->n_backends) {
+            src_backend_name = ggml_backend_name(sched->backends[src_backend_id]);
+        }
+        if (dst_backend_id >= 0 && dst_backend_id < sched->n_backends) {
+            dst_backend_name = ggml_backend_name(sched->backends[dst_backend_id]);
+        }
+    }
+
+    GGML_LOG_INFO(
+        "ggml-backend: COPY_MARKER: marker=%s split=%d src_b=%d src_name=%s dst_b=%d dst_name=%s src='%s' dst='%s' bytes=%zu extra=%s\\n",
+        marker ? marker : "",
+        split_id,
+        src_backend_id,
+        src_backend_name ? src_backend_name : "",
+        dst_backend_id,
+        dst_backend_name ? dst_backend_name : "",
+        src ? src->name : "",
+        dst ? dst->name : "",
+        nbytes,
+        extra ? extra : "");
+}
+
 static inline void ggml_backend_sched_trace_copy_(
         ggml_backend_sched_t sched,
         const char * stage,
@@ -1051,10 +1206,60 @@ struct ggml_backend_sched_copy_stats_ {
     uint64_t sync_copy = 0;
     uint64_t event_waits = 0;
     uint64_t event_records = 0;
+    uint64_t input_copies = 0;
+    uint64_t input_copy_bytes = 0;
+    uint64_t user_sync_bytes = 0;
+    uint64_t async_ok_bytes = 0;
+    uint64_t async_fallback_bytes = 0;
+    uint64_t no_async_bytes = 0;
+    uint64_t sync_copy_bytes = 0;
     uint64_t moe_sparse_inputs = 0;
     uint64_t moe_sparse_ranges = 0;
     uint64_t moe_sparse_bytes = 0;
 };
+
+struct ggml_backend_sched_split_copy_stats_ {
+    uint64_t inter_backend_inputs = 0;
+    uint64_t inter_backend_input_bytes = 0;
+    uint64_t async_ok = 0;
+    uint64_t async_ok_bytes = 0;
+    uint64_t async_fallback = 0;
+    uint64_t async_fallback_bytes = 0;
+    uint64_t no_async = 0;
+    uint64_t no_async_bytes = 0;
+    uint64_t sync_copy = 0;
+    uint64_t sync_copy_bytes = 0;
+};
+
+static inline void ggml_backend_sched_split_copy_stats_dump_(
+        ggml_backend_sched_t sched,
+        const std::vector<ggml_backend_sched_split_copy_stats_> & split_stats) {
+    if (!ggml_backend_sched_trace_copy_enabled_() || sched == NULL) {
+        return;
+    }
+
+    for (size_t split_id = 0; split_id < split_stats.size(); ++split_id) {
+        const auto & st = split_stats[split_id];
+        const int dst_backend_id = split_id < (size_t) sched->n_splits ? sched->splits[split_id].backend_id : -1;
+        const char * dst_backend_name = (dst_backend_id >= 0 && dst_backend_id < sched->n_backends) ? ggml_backend_name(sched->backends[dst_backend_id]) : "";
+        GGML_LOG_INFO(
+            "ggml-backend: split-copy-summary: split=%zu dst_b=%d dst_name=%s inter_backend_inputs=%llu inter_backend_input_bytes=%llu async_ok=%llu async_ok_bytes=%llu async_fallback=%llu async_fallback_bytes=%llu no_async=%llu no_async_bytes=%llu sync_copy=%llu sync_copy_bytes=%llu\n",
+            split_id,
+            dst_backend_id,
+            dst_backend_name ? dst_backend_name : "",
+            (unsigned long long) st.inter_backend_inputs,
+            (unsigned long long) st.inter_backend_input_bytes,
+            (unsigned long long) st.async_ok,
+            (unsigned long long) st.async_ok_bytes,
+            (unsigned long long) st.async_fallback,
+            (unsigned long long) st.async_fallback_bytes,
+            (unsigned long long) st.no_async,
+            (unsigned long long) st.no_async_bytes,
+            (unsigned long long) st.sync_copy,
+            (unsigned long long) st.sync_copy_bytes);
+    }
+}
+
 
 static inline void ggml_backend_sched_copy_stats_dump_(
         ggml_backend_sched_t sched,
@@ -1064,17 +1269,31 @@ static inline void ggml_backend_sched_copy_stats_dump_(
     }
 
     GGML_LOG_INFO(
-        "ggml-backend: copy-summary: user_sync=%llu async_ok=%llu async_fallback=%llu no_async=%llu sync_copy=%llu event_waits=%llu event_records=%llu moe_sparse_inputs=%llu moe_sparse_ranges=%llu moe_sparse_bytes=%llu\n",
+        "ggml-backend: copy-summary: input_copies=%llu input_copy_bytes=%llu user_sync=%llu user_sync_bytes=%llu async_ok=%llu async_ok_bytes=%llu async_fallback=%llu async_fallback_bytes=%llu no_async=%llu no_async_bytes=%llu sync_copy=%llu sync_copy_bytes=%llu event_waits=%llu event_records=%llu moe_sparse_inputs=%llu moe_sparse_ranges=%llu moe_sparse_bytes=%llu\n",
+        (unsigned long long) st.input_copies,
+        (unsigned long long) st.input_copy_bytes,
         (unsigned long long) st.user_sync_copies,
+        (unsigned long long) st.user_sync_bytes,
         (unsigned long long) st.async_ok,
+        (unsigned long long) st.async_ok_bytes,
         (unsigned long long) st.async_fallback,
+        (unsigned long long) st.async_fallback_bytes,
         (unsigned long long) st.no_async,
+        (unsigned long long) st.no_async_bytes,
         (unsigned long long) st.sync_copy,
+        (unsigned long long) st.sync_copy_bytes,
         (unsigned long long) st.event_waits,
         (unsigned long long) st.event_records,
         (unsigned long long) st.moe_sparse_inputs,
         (unsigned long long) st.moe_sparse_ranges,
         (unsigned long long) st.moe_sparse_bytes);
+
+    GGML_LOG_INFO(
+        "ggml-backend: COPY_MARKER: marker=copy-summary split=-1 src_b=-1 src_name= dst_b=-1 dst_name= src='' dst='' bytes=%llu extra=event_waits=%llu,event_records=%llu,moe_sparse_ranges=%llu\n",
+        (unsigned long long) st.input_copy_bytes,
+        (unsigned long long) st.event_waits,
+        (unsigned long long) st.event_records,
+        (unsigned long long) st.moe_sparse_ranges);
 }
 
 // returns the backend that should be used for the node based on the current locations
@@ -1756,6 +1975,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<ggml_bitset_t> used_ids;
     std::vector<uint8_t> moe_copy_tmp;
     ggml_backend_sched_copy_stats_ copy_stats;
+    std::vector<ggml_backend_sched_split_copy_stats_> split_copy_stats(sched->n_splits);
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1782,14 +2002,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     input ? input->flags : 0);
             }
 
+            const bool is_inter_backend_input = input_backend_id >= 0 && input_backend_id != split_backend_id;
+            if (is_inter_backend_input) {
+                split_copy_stats[split_id].inter_backend_inputs++;
+                split_copy_stats[split_id].inter_backend_input_bytes += ggml_nbytes(input);
+                ggml_backend_sched_trace_marker_(sched, "split-copy-input", split_id, split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), "split-input-cross-backend");
+                if (ggml_backend_sched_trace_copy_enabled_()) {
+                    GGML_LOG_INFO(
+                        "ggml-backend: split-copy-path: split=%d input_id=%d src_b=%d dst_b=%d src='%s' dst='%s' bytes=%zu tensor_is_copy=%d user_input=%d\n",
+                        split_id,
+                        input_id,
+                        input_backend_id,
+                        split_backend_id,
+                        input ? input->name : "",
+                        input_cpy ? input_cpy->name : "",
+                        input ? ggml_nbytes(input) : 0,
+                        input && strstr(input->name, "(copy)") != NULL ? 1 : 0,
+                        input && (input->flags & GGML_TENSOR_FLAG_INPUT) ? 1 : 0);
+                }
+            }
+
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     copy_stats.user_sync_copies++;
+                    copy_stats.user_sync_bytes += ggml_nbytes(input);
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
+                    copy_stats.user_sync_copies++;
+                    copy_stats.user_sync_bytes += ggml_nbytes(input);
                     ggml_backend_synchronize(split_backend);
                 }
+                ggml_backend_sched_trace_marker_(sched, "5.user-sync", split_id, split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), "user-input");
                 ggml_backend_sched_trace_copy_(sched, "5.user-sync", split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), "user-input");
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
@@ -1867,6 +2111,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         copy_stats.moe_sparse_ranges++;
                         copy_stats.moe_sparse_bytes += copy_bytes;
+                        moe_sparse_stats.expert_ranges_copied++;
+                        moe_sparse_stats.experts_copied += (last_id - first_id + 1);
+                        moe_sparse_stats.bytes_copied += copy_bytes;
                         if (ggml_backend_sched_trace_copy_enabled_()) {
                             GGML_LOG_INFO(
                                 "ggml-backend: copy-moe-range: split=%d src_b=%d dst_b=%d src='%s' dst='%s' first_id=%d last_id=%d expert_offset=%zu bytes=%zu host=%d\n",
@@ -1936,14 +2183,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const bool async_ok = has_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
                     if (async_ok) {
                         copy_stats.async_ok++;
-                        ggml_backend_sched_trace_copy_(sched, "5.async-ok", split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), "cpy_tensor_async");
+                        copy_stats.async_ok_bytes += ggml_nbytes(input);
+                        split_copy_stats[split_id].async_ok++;
+                        split_copy_stats[split_id].async_ok_bytes += ggml_nbytes(input);
+                        ggml_backend_sched_trace_marker_(sched, "5.async", split_id, split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), "cpy_tensor_async");
+                        ggml_backend_sched_trace_copy_(sched, "5.async", split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), "cpy_tensor_async");
                     }
                     if (!async_ok) {
                         if (has_async) {
                             copy_stats.async_fallback++;
+                            copy_stats.async_fallback_bytes += ggml_nbytes(input);
+                            split_copy_stats[split_id].async_fallback++;
+                            split_copy_stats[split_id].async_fallback_bytes += ggml_nbytes(input);
                         } else {
                             copy_stats.no_async++;
+                            copy_stats.no_async_bytes += ggml_nbytes(input);
+                            split_copy_stats[split_id].no_async++;
+                            split_copy_stats[split_id].no_async_bytes += ggml_nbytes(input);
                         }
+                        ggml_backend_sched_trace_marker_(sched, "5.async", split_id, split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), has_async ? "async-copy-failed" : "iface-null");
                         ggml_backend_sched_trace_copy_(sched, has_async ? "5.async-fallback" : "5.no-async", split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), has_async ? "async-copy-failed" : "iface-null");
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1952,7 +2210,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_synchronize(split_backend);
                         }
                         copy_stats.sync_copy++;
-                        ggml_backend_sched_trace_copy_(sched, "5.sync-copy", split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), "blocking-copy");
+                        copy_stats.sync_copy_bytes += ggml_nbytes(input);
+                        split_copy_stats[split_id].sync_copy++;
+                        split_copy_stats[split_id].sync_copy_bytes += ggml_nbytes(input);
+                        ggml_backend_sched_trace_marker_(sched, "5.sync", split_id, split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), "blocking-copy");
+                        ggml_backend_sched_trace_copy_(sched, "5.sync", split_backend_id, input_backend_id, input, input_cpy, ggml_nbytes(input), "blocking-copy");
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
@@ -1963,6 +2225,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 ggml_backend_sched_log_moe_sparse_stats_(&moe_sparse_stats);
+                ggml_backend_sched_split_copy_stats_dump_(sched, split_copy_stats);
                 ggml_backend_sched_copy_stats_dump_(sched, copy_stats);
                 return ec;
             }
