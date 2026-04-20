@@ -1,0 +1,17 @@
+ggml_metal_device_init: using device index 2 from GGML_METAL_DEVICE_INDEX
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.039 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   AMD Radeon PRO W6800X Duo
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal3  (5001)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = false
+ggml_metal_device_init: has unified memory    = false
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = false
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 34342.96 MB
+llama_model_load_from_file_impl: using device Metal (AMD Radeon PRO W6800X Duo) (unknown id) - 32751 MiB free
