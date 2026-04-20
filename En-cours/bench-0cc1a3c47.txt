@@ -1,6 +1,0 @@
-| model                          |       size |     params | backend    | threads | n_batch | n_ubatch |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | ------: | -------: | --------------: | -------------------: |
-| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | Metal,BLAS |      12 |    4096 |     1024 |           pp128 |        235.53 ± 0.15 |
-| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | Metal,BLAS |      12 |    4096 |     1024 |           tg128 |         80.06 ± 0.26 |
-
-build: 0cc1a3c47 (7922)

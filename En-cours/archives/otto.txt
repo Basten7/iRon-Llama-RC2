@@ -1,8 +1,0 @@
-| model                          |       size |     params | backend    | threads | n_batch | n_ubatch | fa | mmap |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | ------: | -------: | -: | ---: | --------------: | -------------------: |
-| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | Metal,BLAS |      12 |      32 |       32 |  1 |    1 |          pp1024 |        410.80 ± 0.46 |
-| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | Metal,BLAS |      12 |      32 |       32 |  1 |    1 |           tg256 |         75.94 ± 2.45 |
-| qwen3moe 30B.A3B Q6_K          |  23.36 GiB |    30.53 B | Metal,BLAS |      12 |      32 |       32 |  1 |    1 |          pp1024 |        315.77 ± 3.09 |
-| qwen3moe 30B.A3B Q6_K          |  23.36 GiB |    30.53 B | Metal,BLAS |      12 |      32 |       32 |  1 |    1 |           tg256 |         73.10 ± 0.68 |
-
-build: 7fd0ed0b5 (7942)

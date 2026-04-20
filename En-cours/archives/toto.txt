@@ -1,6 +1,0 @@
-| model                          |       size |     params | backend    | threads | fa |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | -: | --------------: | -------------------: |
-| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | Metal,BLAS |      12 |  1 |             pp1 |          5.58 ± 0.11 |
-| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | Metal,BLAS |      12 |  1 |             tg1 |          5.58 ± 0.09 |
-
-build: 75032b039 (7937)
