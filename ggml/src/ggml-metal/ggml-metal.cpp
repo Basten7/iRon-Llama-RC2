@@ -1214,9 +1214,9 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
     const int64_t offload_min_bs     = ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
     int64_t       effective_offload_min_bs = offload_min_bs;
     const int     small_mat_offload_max_bs = ggml_metal_env_mgpu_small_mat_offload_max_bs_();
-    const int     pp_dense_mul_mat_min_bs = ggml_metal_env_mgpu_pp_dense_mul_mat_min_bs_();
-    const int     pp_dense_mul_mat_min_work_m = ggml_metal_env_mgpu_pp_dense_mul_mat_min_work_m_();
-    const int64_t mul_mat_work_m = ggml_metal_mul_mat_work_m_(op);
+//    const int     pp_dense_mul_mat_min_bs = ggml_metal_env_mgpu_pp_dense_mul_mat_min_bs_();
+//    const int     pp_dense_mul_mat_min_work_m = ggml_metal_env_mgpu_pp_dense_mul_mat_min_work_m_();
+//    const int64_t mul_mat_work_m = ggml_metal_mul_mat_work_m_(op);
     bool          small_mat_override = false;
 
     // Limit this hook to matmul-like ops only.

@@ -2726,7 +2726,7 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     // Provide ne20 (head size V) via GGML_TENSOR_LOCALS on src2
     GGML_TENSOR_LOCALS(int32_t, ne2, op->src[2], ne); // ne20
 
-    const bool has_mask  = op->src[3] != nullptr;
+    //const bool has_mask  = op->src[3] != nullptr; TOTO
     const bool has_sinks = op->src[4] != nullptr;
 
     float max_bias = 0.0f;

@@ -2038,6 +2038,10 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 
 
 void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+        if (size == 0) {
+            return;
+        }
+    
     if (buf->is_shared) {
         memcpy(data, (const char *) tensor->data + offset, size);
         return;
@@ -2054,8 +2058,17 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
 
-        GGML_ASSERT(buf_dst);
-
+        bool copy_back = false;
+        
+                // newBufferWithBytesNoCopy() may return nil when "data" is not backed by
+                // a page-aligned/page-sized host allocation acceptable to Metal.
+                // Fall back to a regular shared staging buffer, then memcpy() after the blit.
+                if (!buf_dst) {
+                    buf_dst = [buf->dev->mtl_device newBufferWithLength:size
+                                                                options:MTLResourceStorageModeShared];
+                    GGML_ASSERT(buf_dst);
+                    copy_back = true;
+                }
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 
         {
@@ -2072,6 +2085,9 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+        if (copy_back) {
+            memcpy(data, [buf_dst contents], size);
+        }
     }
 }
 
