@@ -587,7 +587,7 @@ private:
 };
 
 // TODO: derive llm_build_delta_net_base instead
-struct llm_build_qwen35moe : public llm_build_qwen35 {
+struct llm_build_qwen35moe : public llm_build_delta_net_base {
     llm_build_qwen35moe(const llama_model & model, const llm_graph_params & params);
 private:
     ggml_tensor * build_layer_attn(

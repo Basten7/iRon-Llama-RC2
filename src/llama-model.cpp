@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -46,6 +47,29 @@ static int64_t iron_lcm_i64(int64_t a, int64_t b) {
         return 0;
     }
     return (a / iron_gcd_i64(a, b)) * b;
+}
+
+// iRon-Llama Qwen3.5 / Qwen3.6 placement flags.
+// GGML_METAL_QWEN35_RECURRENT_FFN=1 or unset: preserve existing hybrid behavior.
+// GGML_METAL_QWEN35_RECURRENT_FFN=0: keep recurrent Qwen35/Qwen35MoE layers fully CPU-side, including FFN/MoE tensors.
+static bool llama_env_qwen35_recurrent_ffn_metal_enabled() {
+    const char * val = getenv("GGML_METAL_QWEN35_RECURRENT_FFN");
+
+    if (val == nullptr) {
+        return true;
+    }
+
+    return atoi(val) != 0;
+}
+
+static bool llama_env_qwen35_debug_placement_enabled() {
+    const char * val = getenv("GGML_METAL_QWEN35_DEBUG_PLACEMENT");
+
+    if (val == nullptr) {
+        return false;
+    }
+
+    return atoi(val) != 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -134,6 +158,53 @@ static struct ggml_backend_meta_split_state llama_meta_device_get_split_state(co
     
     const std::regex pattern_output_weight("output\\.weight");
     const std::regex pattern_output_bias  ("output\\.bias");
+    
+    // iRon-Llama V4:
+    // Qwen3.5 / Qwen3.6 hybrid placement policy.
+    //
+    // Recurrent / SSM path is kept CPU-side because Metal SSM/recurrent is not
+    // stable on W6800X Duo yet. However, FFN / MoE tensors inside recurrent
+    // layers must NOT be captured by the recurrent CPU fallback, otherwise
+    // Qwen3.6 TG collapses to CPU-level speed.
+    auto is_qwen35_family = [&]() -> bool {
+        return ud->model->arch == LLM_ARCH_QWEN35 ||
+               ud->model->arch == LLM_ARCH_QWEN35MOE;
+    };
+
+    auto is_qwen35_ffn_like = [&]() -> bool {
+        return std::regex_match(tensor_name, pattern_ffn_up_gate_weight) ||
+               std::regex_match(tensor_name, pattern_ffn_up_gate_bias)   ||
+               std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+               std::regex_match(tensor_name, pattern_ffn_down_weight)    ||
+               std::regex_match(tensor_name, pattern_ffn_down_bias)      ||
+               std::regex_match(tensor_name, pattern_ffn_down_exps_bias) ||
+               tensor_name.find(".ffn_gate_inp")       != std::string::npos ||
+               tensor_name.find(".ffn_gate_exps")      != std::string::npos ||
+               tensor_name.find(".ffn_up_exps")        != std::string::npos ||
+               tensor_name.find(".ffn_down_exps")      != std::string::npos ||
+               tensor_name.find(".ffn_gate_shexp")     != std::string::npos ||
+               tensor_name.find(".ffn_up_shexp")       != std::string::npos ||
+               tensor_name.find(".ffn_down_shexp")     != std::string::npos ||
+               tensor_name.find(".ffn_gate_inp_shexp") != std::string::npos;
+    };
+
+    auto is_qwen35_recurrent_cpu_like = [&]() -> bool {
+        return std::regex_match(tensor_name, pattern_qkv_weight)       ||
+               std::regex_match(tensor_name, pattern_qkv_bias)         ||
+               std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+               std::regex_match(tensor_name, pattern_ssm_dt)           ||
+               std::regex_match(tensor_name, pattern_ssm_a)            ||
+               std::regex_match(tensor_name, pattern_ssm_alpha)        ||
+               std::regex_match(tensor_name, pattern_ssm_beta)         ||
+               std::regex_match(tensor_name, pattern_ssm_beta_alpha)   ||
+               std::regex_match(tensor_name, pattern_r_cache)          ||
+               std::regex_match(tensor_name, pattern_s_cache)          ||
+               std::regex_match(tensor_name, pattern_ssm_conv1d)       ||
+               std::regex_match(tensor_name, pattern_ssm_out_weight)   ||
+               tensor_name.find(".ssm_") != std::string::npos;
+    };
+
+    
     
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
@@ -232,7 +303,6 @@ static struct ggml_backend_meta_split_state llama_meta_device_get_split_state(co
         if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
-        
         // FFN
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
@@ -243,6 +313,7 @@ static struct ggml_backend_meta_split_state llama_meta_device_get_split_state(co
         if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
+        
         if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
         }
@@ -330,24 +401,59 @@ static struct ggml_backend_meta_split_state llama_meta_device_get_split_state(co
     };
     
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<int64_t> & segments) -> std::vector<int64_t> {
-        if (hparams.is_recurrent(il)) {
-            // linear attention
-            const int64_t head_dim  = hparams.ssm_d_state;
+        const bool qwen35_recurrent_ffn_metal_enabled = llama_env_qwen35_recurrent_ffn_metal_enabled();
+        const bool qwen35_debug_placement             = llama_env_qwen35_debug_placement_enabled();
+
+        const bool qwen35_recurrent_layer =
+            is_qwen35_family() &&
+            hparams.is_recurrent(il);
+
+        const bool qwen35_ffn_like = is_qwen35_ffn_like();
+
+        const bool qwen35_hybrid_ffn_gpu =
+            qwen35_recurrent_ffn_metal_enabled &&
+            qwen35_recurrent_layer &&
+            qwen35_ffn_like;
+
+        if (qwen35_debug_placement && qwen35_recurrent_layer && qwen35_ffn_like) {
+            if (qwen35_recurrent_ffn_metal_enabled) {
+                LLAMA_LOG_INFO(
+                    "load_tensors: tensor %s Qwen35 recurrent FFN/MoE split-granularity allowed for Metal, layer=%u\n",
+                    tensor_name.c_str(), il);
+            } else {
+                LLAMA_LOG_INFO(
+                    "load_tensors: tensor %s Qwen35 recurrent FFN/MoE split-granularity kept CPU by GGML_METAL_QWEN35_RECURRENT_FFN=0, layer=%u\n",
+                    tensor_name.c_str(), il);
+            }
+        }
+
+        if (hparams.is_recurrent(il) && !qwen35_hybrid_ffn_gpu) {
+            // linear attention / recurrent SSM tensors stay CPU-side
+            const int64_t head_dim        = hparams.ssm_d_state;
             const int64_t granularity_qkv = iron_lcm_i64(blck_size, head_dim);
-            if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_attn_gate_weight) ||
-                std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+
+            if (std::regex_match(tensor_name, pattern_qkv_weight) ||
+                std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+                std::regex_match(tensor_name, pattern_ssm_conv1d) ||
+                std::regex_match(tensor_name, pattern_ssm_out_weight)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv);
             }
-            if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
-                std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta)) {
+
+            if (std::regex_match(tensor_name, pattern_ssm_dt) ||
+                std::regex_match(tensor_name, pattern_ssm_a) ||
+                std::regex_match(tensor_name, pattern_ssm_alpha) ||
+                std::regex_match(tensor_name, pattern_ssm_beta)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv / head_dim);
             }
+
             if (std::regex_match(tensor_name, pattern_ssm_beta_alpha)) {
                 return std::vector<int64_t>(segments.size(), 2 * (granularity_qkv / head_dim));
             }
+
             if (std::regex_match(tensor_name, pattern_r_cache)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * (hparams.ssm_d_conv - 1));
             }
+
             if (std::regex_match(tensor_name, pattern_s_cache)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
             }
@@ -355,45 +461,67 @@ static struct ggml_backend_meta_split_state llama_meta_device_get_split_state(co
             // regular attention
             const uint32_t n_gqa    = hparams.n_gqa(il);
             const uint32_t n_embd_q = n_gqa * hparams.n_embd_head_k;
+
             if (std::regex_match(tensor_name, pattern_attn_sinks)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {iron_lcm_i64(n_embd_q, blck_size)/n_embd_q * n_gqa};
+                return {iron_lcm_i64(n_embd_q, blck_size) / n_embd_q * n_gqa};
             }
-            
+
             const int64_t granularity_q = iron_lcm_i64(n_embd_q, blck_size);
-            if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias)) {
+
+            if (std::regex_match(tensor_name, pattern_q_weight) ||
+                std::regex_match(tensor_name, pattern_q_bias)) {
                 GGML_ASSERT(segments.size() == 1);
-                // some models have Q gate tensors, for those cases the granularity needs to be doubled:
-                if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
-                    return {iron_lcm_i64(2*n_embd_q, blck_size)};
+
+                // Some models have Q gate tensors; for those cases the granularity needs to be doubled.
+                if (ud->model->arch == LLM_ARCH_QWEN3NEXT ||
+                    ud->model->arch == LLM_ARCH_QWEN35 ||
+                    ud->model->arch == LLM_ARCH_QWEN35MOE) {
+                    return {iron_lcm_i64(2 * n_embd_q, blck_size)};
                 }
+
                 return {granularity_q};
             }
+
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_q};
             }
-            
+
             const int64_t granularity_kv = granularity_q / n_gqa;
+
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
                 std::regex_match(tensor_name, pattern_kv_cache)) {
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_kv};
             }
-            if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
+
+            if (std::regex_match(tensor_name, pattern_qkv_weight) ||
+                std::regex_match(tensor_name, pattern_qkv_bias)) {
                 GGML_ASSERT(segments.size() == 3);
                 return {granularity_q, granularity_kv, granularity_kv};
             }
         }
-        
-        // FFN
-        if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight) || std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
-            std::regex_match(tensor_name, pattern_ffn_gate_up_weight) || std::regex_match(tensor_name, pattern_ffn_down_weight)) {
+
+        // Qwen35/Qwen35MoE hybrid:
+        // Recurrent SSM tensors stay CPU-side. FFN/MoE tensors in recurrent layers
+        // may use normal FFN split granularity only when
+        // GGML_METAL_QWEN35_RECURRENT_FFN is unset or non-zero.
+        if (qwen35_hybrid_ffn_gpu) {
             GGML_ASSERT(segments.size() <= 2);
             return std::vector<int64_t>(segments.size(), blck_size);
         }
-        
+
+        // FFN
+        if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight) ||
+            std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
+            std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+            std::regex_match(tensor_name, pattern_ffn_down_weight)) {
+            GGML_ASSERT(segments.size() <= 2);
+            return std::vector<int64_t>(segments.size(), blck_size);
+        }
+
         // everything else
         GGML_ASSERT(segments.size() == 1);
         return {1};
@@ -2894,29 +3022,31 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             } break;
         case LLM_ARCH_QWEN35:
             {
+                // Qwen3.5 / Qwen3.6 dense-or-MoE hybrid.
+                // Common hparams (n_embd/n_layer/n_head/n_ff/experts) are loaded by the generic path.
+                // This arch-specific block only loads Qwen3.5 DeltaNet / SSM metadata.
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+
                 ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
 
-                // Load linear attention (gated delta net) parameters
                 ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
                 ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
                 ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
                 ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
                 ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
-                // Mark recurrent layers (linear attention layers)
                 {
                     uint32_t full_attn_interval = 4;
-                    // iRon-Llama compatibility: keep Qwen3.5 default full_attn_interval = 4.
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
                         hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
                     }
                 }
 
                 switch (hparams.n_layer) {
-                    case 24: type = hparams.n_embd == 1024 ? LLM_TYPE_1B /* iRon fallback for Qwen3.5 0.8B */ : LLM_TYPE_2B; break;
-                    case 32: type = hparams.n_embd == 2560 ? LLM_TYPE_4B : LLM_TYPE_9B; break;
-                    case 64: type = LLM_TYPE_27B; break;
+                    case 40: type = hparams.n_expert > 0 ? LLM_TYPE_35B_A3B : LLM_TYPE_35B; break;
+                    case 65: type = LLM_TYPE_27B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
@@ -3089,9 +3219,44 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    const int n_layer      = hparams.n_layer;
-    const int n_gpu_layers = this->n_gpu_layers();
+    // Qwen3.6 / qwen35moe: avoid splitting SSM/recurrent blocks across CPU/GPU.
+    // The model has full-attention layers every 4 layers:
+    //   3, 7, 11, ..., 39
+    // Therefore groups are:
+    //   [0,1,2,3], [4,5,6,7], ..., [36,37,38,39]
+    //
+    // llama.cpp offloads from the end, including the output layer.
+    // For example:
+    //   -ngl 4 => layers 37,38,39 + output  => bad, splits [36,37,38,39]
+    //   -ngl 5 => layers 36,37,38,39 + output => aligned
+    
+    const int n_layer = hparams.n_layer;
+    int n_gpu_layers  = this->n_gpu_layers();
+    
+    if (arch == LLM_ARCH_QWEN35MOE && n_gpu_layers > 1) {
+        const int block_size = 4;
 
+        const int n_rep_requested = std::min(n_gpu_layers - 1, n_layer);
+        const int start_layer     = n_layer - n_rep_requested;
+
+        const int aligned_start_layer = (start_layer / block_size) * block_size;
+        const int n_rep_aligned       = n_layer - aligned_start_layer;
+        const int n_gpu_layers_aligned = n_rep_aligned + 1; // + output layer
+
+        if (n_gpu_layers_aligned != n_gpu_layers) {
+            LLAMA_LOG_WARN(
+                "%s: qwen35moe: adjusting n_gpu_layers from %d to %d "
+                "to avoid splitting SSM/recurrent block, start_layer %d -> %d, block_size = %d\n",
+                __func__,
+                n_gpu_layers,
+                n_gpu_layers_aligned,
+                start_layer,
+                aligned_start_layer,
+                block_size);
+
+            n_gpu_layers = n_gpu_layers_aligned;
+        }
+    }
     const bool use_mmap_buffer = true;
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
@@ -3145,9 +3310,48 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     const int i_gpu_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0);
+    
+    
+    if (arch == LLM_ARCH_QWEN35MOE && n_gpu_layers > 1) {
+        const int block_size = 4;
+        const int n_rep_requested = std::min(n_gpu_layers - 1, n_layer);
+        const int start_layer     = n_layer - n_rep_requested;
+        const int aligned_start_layer = ((start_layer + block_size - 1) / block_size) * block_size;
+        const int n_rep_aligned       = n_layer - aligned_start_layer;
+        const int n_gpu_layers_aligned = n_rep_aligned + 1;
+
+        if (n_gpu_layers_aligned != n_gpu_layers) {
+            LLAMA_LOG_WARN(
+                "%s: qwen35moe FIX ACTIVE: n_gpu_layers %d -> %d (block=%d)\n",
+                __func__,
+                n_gpu_layers,
+                n_gpu_layers_aligned,
+                block_size);
+
+            n_gpu_layers = n_gpu_layers_aligned;
+        }
+    }
+    
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, int(n_layer) + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < int(hparams.n_layer) && hparams.is_swa(il);
+        
+        // iRon-Llama V4 Qwen35/Qwen35MoE hybrid placement:
+        // - recurrent / SSM layers use CPU as their base device for graph correctness;
+        // - FFN / MoE tensors inside those recurrent layers are overridden per tensor
+        //   below, during create_tensor(), and are allowed to use Metal.
+        //
+        // Do not use a hard-coded full_attention_interval here: hparams.is_recurrent(il)
+        // is the authoritative layer classification for Qwen3.5 / Qwen3.6 variants.
+        if ((arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) &&
+            il < int(hparams.n_layer) &&
+            hparams.is_recurrent(il)) {
+            LLAMA_LOG_DEBUG(
+                "load_tensors: layer %3d Qwen35 recurrent base CPU; FFN/MoE tensors may be Metal, is_swa = %d\n",
+                il, is_swa);
+            return {cpu_dev, &pimpl->cpu_buft_list};
+        }
+        
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s dev=%p, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), (void *) cpu_dev, is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -3319,8 +3523,62 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 case LLM_TENSOR_LAYER_OUTPUT:
                     buft_list = pimpl->dev_output.buft_list;
                     break;
+//                case LLM_TENSOR_LAYER_REPEATING:
+//                    buft_list = pimpl->dev_layer.at(tn.bid).buft_list;
+//                    break;
                 case LLM_TENSOR_LAYER_REPEATING:
                     buft_list = pimpl->dev_layer.at(tn.bid).buft_list;
+
+                    if ((arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) &&
+                        tn.bid >= 0 &&
+                        tn.bid < int(hparams.n_layer) &&
+                        hparams.is_recurrent(tn.bid)) {
+
+                        const bool is_ffn_tensor =
+                            tn.tensor == LLM_TENSOR_FFN_GATE_INP ||
+                            tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
+                            tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
+                            tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS ||
+                            tn.tensor == LLM_TENSOR_FFN_GATE_INP_SHEXP ||
+                            tn.tensor == LLM_TENSOR_FFN_GATE_SHEXP ||
+                            tn.tensor == LLM_TENSOR_FFN_UP_SHEXP ||
+                            tn.tensor == LLM_TENSOR_FFN_DOWN_SHEXP ||
+                            tn.tensor == LLM_TENSOR_FFN_GATE ||
+                            tn.tensor == LLM_TENSOR_FFN_UP ||
+                            tn.tensor == LLM_TENSOR_FFN_DOWN;
+
+                        const bool qwen35_recurrent_ffn_metal_enabled = llama_env_qwen35_recurrent_ffn_metal_enabled();
+                        const bool qwen35_debug_placement             = llama_env_qwen35_debug_placement_enabled();
+
+                        if (is_ffn_tensor &&
+                            qwen35_recurrent_ffn_metal_enabled &&
+                            !devices.empty() &&
+                            tn.bid >= i_gpu_start &&
+                            (tn.bid - i_gpu_start) < act_gpu_layers) {
+                            const int layer_gpu = std::upper_bound(
+                                splits.begin(),
+                                splits.begin() + n_devices(),
+                                float(tn.bid - i_gpu_start) / act_gpu_layers
+                            ) - splits.begin();
+
+                            auto * dev = devices.at(layer_gpu);
+                            buft_list = &pimpl->gpu_buft_list.at(dev);
+
+                            if (qwen35_debug_placement) {
+                                LLAMA_LOG_INFO(
+                                    "load_tensors: tensor %s Qwen35 recurrent FFN/MoE tensor placed on Metal, layer=%d\n",
+                                    tn.str().c_str(), tn.bid);
+                            } else {
+                                LLAMA_LOG_DEBUG(
+                                    "load_tensors: tensor %s Qwen35 recurrent FFN/MoE tensor placed on Metal, layer=%d\n",
+                                    tn.str().c_str(), tn.bid);
+                            }
+                        } else if (is_ffn_tensor && qwen35_debug_placement && !qwen35_recurrent_ffn_metal_enabled) {
+                            LLAMA_LOG_INFO(
+                                "load_tensors: tensor %s Qwen35 recurrent FFN/MoE tensor kept on CPU by GGML_METAL_QWEN35_RECURRENT_FFN=0, layer=%d\n",
+                                tn.str().c_str(), tn.bid);
+                        }
+                    }
                     break;
                 default:
                     GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
@@ -3496,9 +3754,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), { n_rot / 2 },
                                                          TENSOR_NOT_REQUIRED | (i != 0 ? TENSOR_DUPLICATED : 0));
 
-                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
-                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
-                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP, "weight", i), { n_embd, n_ff }, 0);
+//                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
+//                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
+//                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP, "weight", i), { n_embd, n_ff }, 0);
+                        
+                        if (n_expert > 0) {
+                            layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert }, 0);
+                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), { n_embd, n_ff, n_expert }, 0);
+                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), { n_embd, n_ff, n_expert }, 0);
+                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff, n_embd, n_expert }, 0);
+                        } else {
+                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
+                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
+                        }
 
                         // optional MLP bias
                         layer.ffn_gate_b =
@@ -7676,16 +7945,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
-                    // output
                     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-                    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
-                    // if output is NULL, init from the input tok embed
                     if (output == NULL) {
                         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
                     }
 
-                    // Calculate dimensions from hyperparameters
                     const int64_t head_k_dim = hparams.ssm_d_state;
                     const int64_t head_v_dim = hparams.ssm_d_state;
                     const int64_t n_k_heads  = hparams.ssm_n_group;
@@ -7701,32 +7967,60 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
 
                         if (!hparams.is_recurrent(i)) {
-                            // Attention layers
-                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), { n_embd, n_embd_head_k * n_head * 2 }, 0);
-                            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), { n_embd, n_embd_k_gqa }, 0);
-                            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), { n_embd, n_embd_v_gqa }, 0);
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k * n_head * 2 }, 0);
+                            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
+                            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, 0);
                             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
 
-                            // Q/K normalization for attention layers
                             layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
                             layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
                         } else {
-                            // Linear attention (gated delta net) specific tensors
-                            // Create tensors with calculated dimensions
-                            layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", i), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
-                            layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", i), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
-                            layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", i), { hparams.ssm_d_conv, conv_dim }, 0);
-                            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   i), { hparams.ssm_dt_rank }, 0);
-                            layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             i), { hparams.ssm_dt_rank }, 0);
-                            layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", i), { n_embd, n_v_heads }, 0);
-                            layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", i), { n_embd, n_v_heads }, 0);
-                            layer.ssm_norm       = create_tensor(tn(LLM_TENSOR_SSM_NORM,       "weight", i), { head_v_dim }, 0);
-                            layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", i), { value_dim, n_embd }, 0);
+                            layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", i), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
+                            layer.wqkv_gate  = create_tensor(tn(LLM_TENSOR_ATTN_GATE,  "weight", i), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
+                            layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", i), { hparams.ssm_d_conv, conv_dim }, 0);
+                            layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   i), { hparams.ssm_dt_rank }, 0);
+                            layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         i), { hparams.ssm_dt_rank }, 0);
+                            layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", i), { n_embd, n_v_heads }, 0);
+                            layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", i), { n_embd, n_v_heads }, 0);
+                            layer.ssm_norm   = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", i), { head_v_dim }, 0);
+                            layer.ssm_out    = create_tensor(tn(LLM_TENSOR_SSM_OUT,    "weight", i), { value_dim, n_embd }, 0);
                         }
 
-                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
-                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
-                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+                        const bool has_moe_ffn =
+                            ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i).str().c_str()) != nullptr;
+
+                        if (has_moe_ffn || n_expert > 0) {
+                            const int64_t n_expert_load =
+                                n_expert > 0 ? n_expert :
+                                ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i).str().c_str())->ne[1];
+
+                            const ggml_tensor * ffn_up_exps_meta =
+                                ml.get_tensor_meta(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i).str().c_str());
+
+                            const int64_t n_ff_exp_load =
+                                hparams.n_ff_exp > 0 ? hparams.n_ff_exp :
+                                ffn_up_exps_meta != nullptr ? ffn_up_exps_meta->ne[1] : n_ff;
+
+                            layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert_load }, 0);
+                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), { n_embd, n_ff_exp_load, n_expert_load }, 0);
+                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), { n_embd, n_ff_exp_load, n_expert_load }, 0);
+                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp_load, n_embd, n_expert_load }, 0);
+
+                            if (hparams.n_ff_shexp > 0) {
+                                layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
+                                layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", i), { n_embd, hparams.n_ff_shexp }, TENSOR_NOT_REQUIRED);
+                                layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", i), { n_embd, hparams.n_ff_shexp }, TENSOR_NOT_REQUIRED);
+                                layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", i), { hparams.n_ff_shexp, n_embd }, TENSOR_NOT_REQUIRED);
+                            }
+                        } else {
+                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
+                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
+
+                            layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), { n_ff }, TENSOR_NOT_REQUIRED);
+                            layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias", i), { n_embd }, TENSOR_NOT_REQUIRED);
+                            layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i), { n_ff }, TENSOR_NOT_REQUIRED);
+                        }
                     }
                 } break;
             case LLM_ARCH_MIMO2:
@@ -8907,7 +9201,12 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             } break;
         case LLM_ARCH_QWEN35:
             {
-                llm = std::make_unique<llm_build_qwen35>(*this, params);
+                const bool has_moe_ffn = !layers.empty() && layers[0].ffn_gate_inp != nullptr;
+                if (hparams.n_expert > 0 || has_moe_ffn) {
+                    llm = std::make_unique<llm_build_qwen35moe>(*this, params);
+                } else {
+                    llm = std::make_unique<llm_build_qwen35>(*this, params);
+                }
             } break;
         case LLM_ARCH_QWEN35MOE:
             {

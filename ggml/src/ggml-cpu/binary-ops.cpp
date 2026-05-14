@@ -1,5 +1,7 @@
 #include "binary-ops.h"
 
+#include <cstdio>
+
 #if defined(GGML_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
 
@@ -20,6 +22,51 @@ static inline float op_mul(float a, float b) {
 
 static inline float op_div(float a, float b) {
     return a / b;
+}
+
+static inline void ggml_debug_print_binary_shape_mismatch(
+        const char * op_name,
+        const ggml_tensor * dst,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const char * reason) {
+    fprintf(stderr,
+        "\n[GGML %s SHAPE MISMATCH]\n"
+        "reason = %s\n"
+        "dst   = %-32s type=%-8s ne=[%lld %lld %lld %lld] nb=[%lld %lld %lld %lld]\n"
+        "src0  = %-32s type=%-8s ne=[%lld %lld %lld %lld] nb=[%lld %lld %lld %lld]\n"
+        "src1  = %-32s type=%-8s ne=[%lld %lld %lld %lld] nb=[%lld %lld %lld %lld]\n"
+        "checks: same(src0,dst)=%d same(src0,src1)=%d can_repeat(src1,src0)=%d can_repeat(src0,src1)=%d\n\n",
+        op_name,
+        reason,
+        dst->name,  ggml_type_name(dst->type),
+        (long long) dst->ne[0],  (long long) dst->ne[1],  (long long) dst->ne[2],  (long long) dst->ne[3],
+        (long long) dst->nb[0],  (long long) dst->nb[1],  (long long) dst->nb[2],  (long long) dst->nb[3],
+        src0->name, ggml_type_name(src0->type),
+        (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+        (long long) src0->nb[0], (long long) src0->nb[1], (long long) src0->nb[2], (long long) src0->nb[3],
+        src1->name, ggml_type_name(src1->type),
+        (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+        (long long) src1->nb[0], (long long) src1->nb[1], (long long) src1->nb[2], (long long) src1->nb[3],
+        ggml_are_same_shape(src0, dst),
+        ggml_are_same_shape(src0, src1),
+        ggml_can_repeat(src1, src0),
+        ggml_can_repeat(src0, src1));
+}
+
+template <float (*op)(float, float)>
+static inline const char * ggml_debug_binary_op_name() {
+    if constexpr (op == op_add) {
+        return "ADD";
+    } else if constexpr (op == op_sub) {
+        return "SUB";
+    } else if constexpr (op == op_mul) {
+        return "MUL";
+    } else if constexpr (op == op_div) {
+        return "DIV";
+    } else {
+        return "BINARY_OP";
+    }
 }
 
 template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
@@ -51,6 +98,12 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    const char * op_name = ggml_debug_binary_op_name<op>();
+
+    if (!ggml_can_repeat(src1, src0) || !ggml_are_same_shape(src0, dst)) {
+        ggml_debug_print_binary_shape_mismatch(op_name, dst, src0, src1,
+            "initial binary-op shape contract failed: expected src1 repeatable to src0 and dst same shape as src0");
+    }
     GGML_ASSERT(ggml_can_repeat(src1, src0) && ggml_are_same_shape(src0, dst));
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -62,6 +115,10 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
     const bool is_src1_contiguous = (nb10 == sizeof(src1_t));
 
     if (!is_src1_contiguous) { // broadcast not implemented yet for non-contiguous
+        if (!ggml_are_same_shape(src0, src1)) {
+            ggml_debug_print_binary_shape_mismatch(op_name, dst, src0, src1,
+                "non-contiguous src1 broadcast is not implemented: expected src0 and src1 to have identical shapes");
+        }
         GGML_ASSERT(ggml_are_same_shape(src0, src1));
     }
 

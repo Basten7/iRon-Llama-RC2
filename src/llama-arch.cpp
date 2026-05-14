@@ -961,10 +961,19 @@ static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
                 LLM_TENSOR_ATTN_GATE,
 
                 LLM_TENSOR_FFN_NORM,
+
+                // Dense Qwen3.6 / Qwen3.5 FFN tensors, required by non-MoE models such as Qwen3.6-27B.
+                LLM_TENSOR_FFN_GATE,
+                LLM_TENSOR_FFN_DOWN,
+                LLM_TENSOR_FFN_UP,
+
+                // MoE Qwen3.6 / Qwen3.5 FFN tensors, required by A3B / expert models.
                 LLM_TENSOR_FFN_GATE_INP,
                 LLM_TENSOR_FFN_GATE_EXPS,
                 LLM_TENSOR_FFN_DOWN_EXPS,
                 LLM_TENSOR_FFN_UP_EXPS,
+
+                // Shared expert tensors used by Qwen3.6 A3B.
                 LLM_TENSOR_FFN_GATE_INP_SHEXP,
                 LLM_TENSOR_FFN_GATE_SHEXP,
                 LLM_TENSOR_FFN_DOWN_SHEXP,

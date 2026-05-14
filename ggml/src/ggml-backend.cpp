@@ -30,6 +30,10 @@
 
 // backend buffer type
 
+
+
+
+
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
     return buft->iface.get_name(buft);
@@ -1054,6 +1058,8 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -1956,9 +1962,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
-
+    
+    
     ggml_backend_sched_split_graph(sched, graph);
-
+    
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }

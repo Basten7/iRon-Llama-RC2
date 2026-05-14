@@ -12,12 +12,237 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
 
 //
 // llama_context
+
+static bool llama_env_enabled_qwen35_phase_aware() {
+    const char * env = getenv("GGML_METAL_QWEN35_PHASE_AWARE");
+    return env != nullptr && atoi(env) != 0;
+}
+
+static bool llama_env_enabled_qwen35_debug_placement() {
+    const char * env = getenv("GGML_METAL_QWEN35_DEBUG_PLACEMENT");
+    return env != nullptr && atoi(env) != 0;
+}
+
+static bool llama_env_qwen35_recurrent_ffn_metal_enabled() {
+    const char * env = getenv("GGML_METAL_QWEN35_RECURRENT_FFN");
+    return env == nullptr || atoi(env) != 0;
+}
+
+static int llama_qwen35_layer_from_name(const char * name) {
+    if (name == nullptr) {
+        return -1;
+    }
+
+    const char * p = strstr(name, "blk.");
+    if (p == nullptr) {
+        return -1;
+    }
+
+    p += 4;
+    if (*p < '0' || *p > '9') {
+        return -1;
+    }
+
+    int il = 0;
+    while (*p >= '0' && *p <= '9') {
+        il = il * 10 + (*p - '0');
+        ++p;
+    }
+
+    return *p == '.' ? il : -1;
+}
+
+static bool llama_qwen35_name_contains(const char * name, const char * fragment) {
+    return name != nullptr && fragment != nullptr && strstr(name, fragment) != nullptr;
+}
+
+static bool llama_qwen35_name_is_ffn_or_moe(const char * name) {
+    return llama_qwen35_name_contains(name, ".ffn_");
+}
+
+static bool llama_qwen35_tensor_name_has_forbidden_cpu_fragment(const ggml_tensor * t) {
+    if (t == nullptr) {
+        return false;
+    }
+
+    static const char * forbidden[] = {
+        "attn_residual",
+        "post_ffn",
+        "post_moe",
+        "l_out",
+        "qwen35_ffn_cpu_out",
+        "qwen35moe_ffn_cpu_out",
+        "qwen35_post_ffn_cpu",
+        "qwen35moe_post_moe_cpu",
+    };
+
+    for (const char * fragment : forbidden) {
+        if (llama_qwen35_name_contains(t->name, fragment)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool llama_qwen35_node_or_sources_have_forbidden_cpu_fragment(const ggml_tensor * node) {
+    if (llama_qwen35_tensor_name_has_forbidden_cpu_fragment(node)) {
+        return true;
+    }
+
+    if (node == nullptr) {
+        return false;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (llama_qwen35_tensor_name_has_forbidden_cpu_fragment(node->src[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool llama_qwen35_node_uses_recurrent_ffn_weight(
+        const llama_model & model,
+        const ggml_tensor * node,
+        int * il_out) {
+    if (node == nullptr) {
+        return false;
+    }
+
+    // The phase-aware override is deliberately narrow: only FFN/MoE matrix
+    // products are allowed to be pulled to Metal. Residual adds, layer outputs,
+    // norms, views, copies, SSM_SCAN, etc. must remain under normal placement.
+    switch (node->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            break;
+        default:
+            return false;
+    }
+
+    if (llama_qwen35_node_or_sources_have_forbidden_cpu_fragment(node)) {
+        return false;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = node->src[i];
+        if (src == nullptr) {
+            continue;
+        }
+
+        if (!llama_qwen35_name_is_ffn_or_moe(src->name)) {
+            continue;
+        }
+
+        const int il = llama_qwen35_layer_from_name(src->name);
+        if (il < 0 || il >= int(model.hparams.n_layer)) {
+            continue;
+        }
+
+        if (!model.hparams.is_recurrent(il)) {
+            continue;
+        }
+
+        if (il_out != nullptr) {
+            *il_out = il;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static void llama_qwen35_apply_phase_backend_policy(
+        ggml_backend_sched_t sched,
+        const llama_model & model,
+        ggml_backend_t backend_cpu,
+        ggml_backend_t backend_metal,
+        ggml_cgraph * gf,
+        int n_tokens) {
+    if (!llama_env_enabled_qwen35_phase_aware()) {
+        return;
+    }
+
+    if (!llama_env_qwen35_recurrent_ffn_metal_enabled()) {
+        if (llama_env_enabled_qwen35_debug_placement()) {
+            LLAMA_LOG_INFO(
+                "qwen35.phase: recurrent FFN/MoE Metal override disabled by GGML_METAL_QWEN35_RECURRENT_FFN=0\n");
+        }
+        return;
+    }
+
+    if (sched == nullptr || backend_cpu == nullptr || backend_metal == nullptr || gf == nullptr) {
+        return;
+    }
+
+    // Apply to both PP and TG. The recurrent Qwen35/Qwen35MoE path keeps
+    // DeltaNet + residual bookkeeping on CPU and exposes only the FFN/MoE
+    // matrix products as a Metal island.
+
+    int n_forced_metal = 0;
+    int n_forced_cpu   = 0;
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node == nullptr) {
+            continue;
+        }
+
+        // Guardrail: explicit CPU-side graph boundary and residual/output nodes.
+        // This prevents the Metal FFN/MoE island from pulling attn_residual into
+        // a CPU -> Metal copy before the final residual add.
+        if (llama_qwen35_node_or_sources_have_forbidden_cpu_fragment(node)) {
+            ggml_backend_sched_set_tensor_backend(sched, node, backend_cpu);
+            ++n_forced_cpu;
+
+            if (llama_env_enabled_qwen35_debug_placement()) {
+                LLAMA_LOG_INFO(
+                    "qwen35.phase: PP force CPU: node=%s op=%s n_tokens=%d\n",
+                    node->name,
+                    ggml_op_name(node->op),
+                    n_tokens);
+            }
+            continue;
+        }
+
+        int il = -1;
+        if (!llama_qwen35_node_uses_recurrent_ffn_weight(model, node, &il)) {
+            continue;
+        }
+
+        ggml_backend_sched_set_tensor_backend(sched, node, backend_metal);
+        ++n_forced_metal;
+
+        if (llama_env_enabled_qwen35_debug_placement()) {
+            LLAMA_LOG_INFO(
+                "qwen35.phase: PP force Metal: node=%s op=%s il=%d n_tokens=%d\n",
+                node->name,
+                ggml_op_name(node->op),
+                il,
+                n_tokens);
+        }
+    }
+
+    if (llama_env_enabled_qwen35_debug_placement()) {
+        LLAMA_LOG_INFO(
+            "qwen35.phase: PP policy done: forced_metal=%d forced_cpu=%d n_tokens=%d\n",
+            n_forced_metal,
+            n_forced_cpu,
+            n_tokens);
+    }
+}
+
+
 //
 
 llama_context::llama_context(
@@ -1199,6 +1424,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        ggml_backend_t backend_metal = nullptr;
+        for (const auto & backend : backends) {
+            ggml_backend_t cur = backend.get();
+            if (cur == nullptr || cur == backend_cpu) {
+                continue;
+            }
+
+            ggml_backend_dev_t dev = ggml_backend_get_device(cur);
+            if (dev == nullptr) {
+                continue;
+            }
+
+            const char * dev_name = ggml_backend_dev_name(dev);
+            if (dev_name != nullptr && strcmp(dev_name, "Metal") == 0) {
+                backend_metal = cur;
+                break;
+            }
+        }
+
+        llama_qwen35_apply_phase_backend_policy(
+                sched.get(), model, backend_cpu, backend_metal, gf, ubatch.n_tokens);
+        
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
